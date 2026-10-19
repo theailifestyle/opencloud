@@ -1,0 +1,11 @@
+# OC_EDGE_MODE=external: an existing reverse proxy (e.g. a Caddy you already run) fronts the console.
+# oc-edge doesn't start (no `edge` profile) and nothing publishes ports. Only the console joins the
+# proxy's network; apps, storage, the gateway and the agent stay off it. Set OC_TRUSTED_PROXY_HOSTS to your
+# proxy's container name so the console trusts X-Forwarded-For only from it.
+services:
+  console:
+    networks: [console, control, proxy]
+networks:
+  proxy:
+    name: ${OC_PROXY_NETWORK:?set OC_PROXY_NETWORK}
+    external: true

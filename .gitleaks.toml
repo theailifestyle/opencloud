@@ -1,0 +1,9 @@
+title = "Open Cloud"
+
+# Default rules still apply. tests/ holds synthetic fixtures only: the RFC 6238
+# test vector and obvious placeholders used to prove redaction. They are not credentials.
+[allowlist]
+paths = [
+  '''(^|/)tests/''',
+  '''__pycache__''',
+]

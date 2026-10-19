@@ -1,0 +1,19 @@
+#!/bin/bash
+# Small helper CLI. Usage: ./opencloud install|status|reset-password|disable-totp|down
+set -euo pipefail
+cd "$(dirname "$0")"
+[ -f .env ] && { set -a; . ./.env; set +a; . ./compose-env.sh; }
+case "${1:-}" in
+  install) exec ./install.sh ;;
+  status) docker compose ps ;;
+  down) docker compose down ;;
+  reset-password)
+    set -a; . ./.env; set +a
+    rm -f "$OC_ROOT/secrets/console/admin-password.scrypt" "$OC_ROOT/secrets/platform/admin-password.scrypt"  # install.sh makes a new one + sets must-change
+    ./install.sh && docker compose restart console ;;
+  disable-totp|reset-2fa)
+    # Break-glass for a lost phone: turns two-step login off (password only). Set it up again under Two-step login.
+    set -a; . ./.env; set +a
+    rm -f "$OC_ROOT/secrets/console/totp.json" && echo "Two-step login is off. Sign in with the password, then set it up again in the console." ;;
+  *) echo "usage: ./opencloud install|status|reset-password|disable-totp|down"; exit 1 ;;
+esac

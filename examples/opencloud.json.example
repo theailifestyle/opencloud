@@ -1,0 +1,5 @@
+{
+  "health": {"path": "/health", "tool": "python"},
+  "read_only": true,
+  "tmpfs": ["/tmp"]
+}

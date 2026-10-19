@@ -1,0 +1,13 @@
+# Open Cloud: AppArmor profile for the rootless BuildKit container (oc-builder) ONLY.
+# Ubuntu 23.10+/24.04 set kernel.apparmor_restrict_unprivileged_userns=1, which blocks the user namespaces
+# rootless BuildKit needs ("rootlesskit: fork/exec /proc/self/exe: permission denied").
+# This named profile is attached to that one container (security_opt apparmor=opencloud-builder); it adds the
+# `userns` permission and is otherwise unconfined, which is what the builder ran with before
+# (apparmor=unconfined). The system-wide sysctl stays on, so every other process keeps the restriction.
+# Installed by install.sh when OC_BUILDER is on and the restriction is active.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile opencloud-builder flags=(unconfined) {
+  userns,
+}

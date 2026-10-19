@@ -1,0 +1,172 @@
+# Open Cloud core. Only `edge` publishes ports (80/443); it runs only with the `edge` profile (OC_EDGE_MODE=internal). Values come from .env (see .env.example).
+name: opencloud
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  pids_limit: 200
+  logging: {driver: local, options: {max-size: "10m", max-file: "3"}}
+services:
+  edge:
+    <<: *hardening
+    image: caddy:${OC_CADDY_TAG:-2.11.7-alpine}
+    container_name: oc-edge
+    profiles: [edge]
+    cap_add: [NET_BIND_SERVICE]
+    ports: ["${OC_HTTP_PORT:-80}:80", "${OC_HTTPS_PORT:-443}:443"]
+    volumes:
+      - ${OC_ROOT}/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${OC_ROOT}/caddy/sites:/etc/caddy/sites:ro
+      - ${OC_ROOT}/sites:/srv/sites:ro   # static sites (agent-written releases; served by file_server)
+      - caddy_data:/data
+      - caddy_config:/config
+    # console: a network shared only with the console, so apps on oc_edge can't reach it directly.
+    networks: [edge, console]
+    mem_limit: 256m
+    healthcheck: {test: [CMD, wget, -q, --spider, "http://127.0.0.1:2019/config/"], interval: 10s, retries: 5}
+  console:
+    <<: *hardening
+    build: console
+    image: opencloud-console:local
+    container_name: oc-console
+    read_only: true
+    environment:
+      OC_AGENT_TOKEN_FILE: /run/oc/agent-token
+      OC_ADMIN_HASH_FILE: /run/oc/auth/admin-password.scrypt
+      OC_APPS_DOMAIN: ${OC_APPS_DOMAIN}
+      OC_CONSOLE_HOST: ${OC_CONSOLE_HOST}
+      OC_PUBLIC_IP: ${OC_PUBLIC_IP:-}
+      OC_S3_HOST: ${OC_S3_HOST}
+      OC_TRUSTED_PROXIES: ${OC_TRUSTED_PROXIES:-1}
+      OC_TRUSTED_PROXY_HOSTS: ${OC_TRUSTED_PROXY_HOSTS:-oc-edge}
+      OC_GENERIC_GATEWAY: ${OC_GENERIC_GATEWAY:-0}
+      OC_OBSERVE: ${OC_OBSERVE:-0}
+      OC_EDGE_MODE: ${OC_EDGE_MODE:-internal}
+    volumes:
+      - ${OC_ROOT}/secrets/platform/agent-token:/run/oc/agent-token:ro
+      # Writable, console-owned (10001, 700): the hash, the must-change flag and two-step login (totp.json).
+      - ${OC_ROOT}/secrets/console:/run/oc/auth
+      - ${OC_ROOT}/secrets/platform/watch-token.console:/run/oc/watch-token:ro
+    # Not on oc_edge: only the edge (via oc_console) and the agent/watch (via oc_control) reach the console.
+    networks: [console, control]
+    mem_limit: 256m
+    healthcheck: {test: [CMD, python, -c, "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/healthz')"], interval: 10s, retries: 5}
+  agent:
+    # The only container with the Docker socket: internal network only, no ports, fixed actions.
+    <<: *hardening
+    build: agent
+    image: opencloud-agent:local
+    container_name: oc-agent
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    environment:
+      OC_ROOT: ${OC_ROOT}
+      OC_APPS_DOMAIN: ${OC_APPS_DOMAIN}
+      OC_AGENT_TOKEN_FILE: ${OC_ROOT}/secrets/platform/agent-token
+      OC_PUBLIC_IP: ${OC_PUBLIC_IP:-}
+      OC_BACKUP_KEEP_DAILY: ${OC_BACKUP_KEEP_DAILY:-7}
+      OC_S3_HOST: ${OC_S3_HOST}
+      OC_BUILDKIT_ADDR: tcp://oc-builder:1234
+      OC_GIT_SSL_CAINFO: ${OC_GIT_SSL_CAINFO:-}
+      OC_API_PROBE_INTERVAL: ${OC_API_PROBE_INTERVAL:-60}
+      OC_CONSOLE_HOST: ${OC_CONSOLE_HOST}
+      OC_WATCH_TOKEN_FILE: ${OC_ROOT}/secrets/platform/watch-token
+      OC_EDGE_MODE: ${OC_EDGE_MODE:-internal}
+      OC_OBSERVE: ${OC_OBSERVE:-0}
+      OC_LOCAL_SOURCES: ${OC_LOCAL_SOURCES:-}
+      OC_ALLOWED_EXTERNAL_NETWORKS: ${OC_ALLOWED_EXTERNAL_NETWORKS:-}
+      OC_ALLOWED_DATA_ROOTS: ${OC_ALLOWED_DATA_ROOTS:-}
+      OC_ALLOWED_SECRET_PATHS: ${OC_ALLOWED_SECRET_PATHS:-}
+      OC_GENERIC_GATEWAY: ${OC_GENERIC_GATEWAY:-0}
+      # Listen only on the control network: the builder (egress network) can't connect to the API.
+      OC_AGENT_BIND: oc-agent.oc_control
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${OC_ROOT}:${OC_ROOT}
+    # egress: plain bridge so git clone can reach the internet; not shared with apps or edge.
+    networks: [control, egress]
+    mem_limit: 512m
+  builder:
+    # Rootless BuildKit: app Dockerfiles build here, not in the host daemon.
+    # Unprivileged, no Docker socket, no host mounts, CPU/memory/pid limits.
+    # Rootless user namespaces need seccomp unconfined and an AppArmor profile that allows userns: "unconfined" by
+    # default; "opencloud-builder" (deploy/apparmor) on hosts that restrict unprivileged userns (see docs/SECURITY.md).
+    image: moby/buildkit:${OC_BUILDKIT_TAG:-v0.34.0-rootless}
+    container_name: oc-builder
+    # Profile "build": always on in internal mode; external mode starts it only with OC_BUILDER=1.
+    profiles: [build]
+    restart: unless-stopped
+    command: [--addr, "tcp://0.0.0.0:1234", --oci-worker-no-process-sandbox]
+    security_opt: ["seccomp=unconfined", "apparmor=${OC_BUILDER_APPARMOR:-unconfined}"]
+    volumes: [buildkit_state:/home/user/.local/share/buildkit]
+    networks: [egress]
+    mem_limit: ${OC_BUILD_MEMORY:-2g}
+    cpus: ${OC_BUILD_CPUS:-1}
+    pids_limit: 1000
+    logging: {driver: local, options: {max-size: "10m", max-file: "3"}}
+  storage:
+    # SeaweedFS (Apache-2.0) S3 API. Master/filer/volume bind to loopback inside the
+    # container; only the authenticated S3 port (8333) is reachable on the network.
+    <<: *hardening
+    image: chrislusf/seaweedfs:${OC_SEAWEEDFS_TAG:-4.48}
+    container_name: oc-storage
+    command: [server, -dir=/data, -ip=127.0.0.1, -ip.bind=127.0.0.1, -s3, -s3.port=8333, -s3.ip.bind=0.0.0.0, -s3.config=/etc/seaweedfs/s3.json]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+    volumes:
+      - ${OC_ROOT}/storage:/data
+      - ${OC_ROOT}/secrets/storage:/etc/seaweedfs:ro
+    networks: {edge: {aliases: [storage]}}
+    mem_limit: 512m
+    healthcheck: {test: [CMD-SHELL, "wget -q -O /dev/null http://127.0.0.1:8333/healthz || exit 1"], interval: 5s, retries: 30, start_period: 10s}
+  llm-gateway:
+    # Optional generic OpenAI-compatible gateway (named endpoints, per-app keys). Off unless OC_GENERIC_GATEWAY=1.
+    <<: *hardening
+    profiles: [gateway]
+    build: gateway
+    image: opencloud-gateway:local
+    container_name: oc-llm-gateway
+    read_only: true
+    volumes:
+      - ${OC_ROOT}/gateway:/run/gateway
+      - ${OC_ROOT}/secrets/gateway-clients:/run/clients:ro
+      - ${OC_ROOT}/secrets/platform/llm-upstream-key:/run/secrets/upstream_key:ro
+    networks: {edge: {aliases: [llm-gateway]}}
+    mem_limit: 128m
+  watch:
+    # Open CloudWatch: metrics, logs, alarms, email, event feed. No Docker socket: it reads
+    # stats and logs from the agent with a read-only token. Apps reach it as http://cloudwatch:8100.
+    <<: *hardening
+    build: watch
+    image: opencloud-watch:local
+    container_name: oc-watch
+    read_only: true
+    environment:
+      OC_WATCH_INTERVAL: ${OC_WATCH_INTERVAL:-60}
+      OC_WATCH_RETENTION_DAYS: ${OC_WATCH_RETENTION_DAYS:-7}
+      OC_WATCH_LOG_RETENTION_DAYS: ${OC_WATCH_LOG_RETENTION_DAYS:-7}
+      OC_SMTP_HOST: ${OC_SMTP_HOST:-}
+      OC_SMTP_PORT: ${OC_SMTP_PORT:-587}
+      OC_SMTP_USER: ${OC_SMTP_USER:-}
+      OC_SMTP_FROM: ${OC_SMTP_FROM:-}
+      OC_SMTP_TO: ${OC_SMTP_TO:-}
+      OC_SMTP_TLS: ${OC_SMTP_TLS:-starttls}
+    volumes:
+      - ${OC_ROOT}/watch:/var/lib/watch
+      - ${OC_ROOT}/secrets/platform/watch-token:/run/oc/watch-token:ro
+    networks: {control: {aliases: [watch]}, edge: {aliases: [cloudwatch]}}
+    mem_limit: 192m
+    healthcheck: {test: [CMD, python, -c, "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8100/healthz')"], interval: 10s, retries: 5}
+volumes:
+  buildkit_state:
+  caddy_data:
+  caddy_config:
+networks:
+  edge:
+    name: oc_edge
+  control:
+    name: oc_control
+    internal: true
+  console:
+    name: oc_console
+    internal: true
+  egress:
+    name: oc_agent_egress

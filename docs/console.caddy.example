@@ -1,0 +1,17 @@
+# Site file for an existing Caddy that fronts Open Cloud (OC_EDGE_MODE=external).
+# Copy to your Caddy's sites directory, replace the hostname, then `caddy validate` and `caddy reload`.
+# The Caddy container must be on OC_PROXY_NETWORK, the same network oc-console joins.
+console.example.com {
+	# Optional extra gate in front of the console's own login (recommended while staging):
+	# basic_auth { import /path/to/users-file }
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		X-Frame-Options SAMEORIGIN
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+	# Caddy sets X-Forwarded-For to the address it saw (client-sent values are dropped unless you
+	# configure trusted_proxies). The console reads one hop from the right: OC_TRUSTED_PROXIES=1.
+	reverse_proxy oc-console:8080
+}

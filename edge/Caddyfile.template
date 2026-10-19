@@ -1,0 +1,37 @@
+{
+	# Admin API stays inside the container.
+	admin localhost:2019
+	__TLS_GLOBAL__
+}
+(security_headers) {
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		Strict-Transport-Security "max-age=31536000"
+		X-Frame-Options SAMEORIGIN
+		-Server
+	}
+}
+__CONSOLE_HOST__ {
+	# Same as security_headers, but the console is never framed or cached.
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		Strict-Transport-Security "max-age=31536000"
+		X-Frame-Options DENY
+		Cache-Control "no-store"
+		-Server
+	}
+	reverse_proxy oc-console:8080
+}
+# s3-public-begin
+# Public S3 endpoint (presigned URLs). Requests are authenticated by SeaweedFS.
+__S3_HOST__ {
+	import security_headers
+	request_body {
+		max_size 5GB
+	}
+	reverse_proxy storage:8333
+}
+# s3-public-end
+import /etc/caddy/sites/*.caddy

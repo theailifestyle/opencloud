@@ -1,0 +1,32 @@
+# Local configuration. install.sh copies .env.example to .env.
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Secrets. OC_ROOT defaults to /srv/opencloud, outside this checkout.
+# These names are ignored so a copied secret cannot be committed.
+secrets/
+*.scrypt
+**/totp.json
+**/smtp-password
+**/agent-token
+**/watch-token
+**/watch-token.console
+**/llm-upstream-key
+**/restic-password
+**/*.pem
+**/*.key
+
+# Installer output, if a local OC_ROOT is pointed inside the checkout.
+observe.compose.yaml
+host-mounts.compose.yaml
+*.log
+.DS_Store
