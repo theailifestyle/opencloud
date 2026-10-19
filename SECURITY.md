@@ -2,9 +2,9 @@
 
 ## Reporting a vulnerability
 
-Email security@example.com.
+Report vulnerabilities privately through GitHub: [open a private security advisory](https://github.com/theailifestyle/opencloud/security/advisories/new). Include what you found, how to reproduce it, and the commit you tested.
 
-Replace `security@example.com` with a real contact address before you publish a fork. Include what you found, how to reproduce it, and the commit you tested. Do not open a public issue for an unpublished vulnerability.
+Do not open a public issue, pull request, or discussion for a vulnerability.
 
 ## How an install is put together
 

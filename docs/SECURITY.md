@@ -112,7 +112,7 @@ Do these after [INSTALL.md](INSTALL.md). None of them are applied for you.
 6. Set `OC_S3_PUBLIC=0` if browsers do not need presigned URLs.
 7. Keep the host and Docker updated, and re-run `sudo ./install.sh` after you pull ([UPGRADING.md](UPGRADING.md)).
 
-Report a vulnerability to the contact in the repository's [SECURITY.md](../SECURITY.md). The address there is a placeholder until the publisher replaces it.
+Report a vulnerability privately through [GitHub private vulnerability reporting](https://github.com/theailifestyle/opencloud/security/advisories/new), as described in [SECURITY.md](../SECURITY.md). Do not open a public issue for it.
 
 ## Network layout
 - `oc_console` (internal): edge and console only. Apps on `oc_edge` cannot reach the console.
