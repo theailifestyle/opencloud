@@ -17,7 +17,7 @@ Use this after [INSTALL.md](INSTALL.md) to check a brand-new machine. Tick each 
 - [ ] `ss -ltn` shows nothing on 80/443 yet
 
 ## 2. Install
-- [ ] `git clone <repository-url> open-cloud && cd open-cloud && ./install.sh` creates `.env` and stops
+- [ ] `git clone https://github.com/theailifestyle/opencloud.git && cd opencloud && ./install.sh` creates `.env` and stops
 - [ ] Edit `.env`: `OC_CONSOLE_HOST`, `OC_APPS_DOMAIN`, `OC_S3_HOST`, `OC_ACME_EMAIL`, `OC_TLS=acme`
 - [ ] `sudo ./install.sh` exits 0 and prints the admin password once. Save it in a password manager
 - [ ] `sudo ./install.sh` again: exits 0, no new password, `sudo sha256sum $OC_ROOT/secrets/platform/* $OC_ROOT/secrets/console/*` unchanged

@@ -5,7 +5,7 @@ Upgrading means a newer copy of this repository on a server that already runs Op
 ## Steps
 
 ```bash
-cd open-cloud
+cd opencloud
 git pull
 sudo ./install.sh
 ```

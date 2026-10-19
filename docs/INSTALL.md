@@ -21,8 +21,8 @@ Ubuntu 23.10 and 24.04 block unprivileged user namespaces. You do not turn that 
 ## Configure
 
 ```bash
-git clone <repository-url> open-cloud
-cd open-cloud
+git clone https://github.com/theailifestyle/opencloud.git
+cd opencloud
 ./install.sh
 ```
 

@@ -45,7 +45,7 @@ The **deployer** (`oc-agent`) is the program that builds an app, starts it, stop
 Install Docker Engine and Compose v2 first, and point DNS at the server (`console.example.com` and `*.apps.example.com` in the example below). Then:
 
 ```bash
-git clone <repository-url> open-cloud && cd open-cloud
+git clone https://github.com/theailifestyle/opencloud.git && cd opencloud
 ./install.sh
 ```
 

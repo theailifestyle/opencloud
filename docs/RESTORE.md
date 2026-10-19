@@ -8,7 +8,7 @@ Nothing in Open Cloud runs a backup on a timer. Use **Back up now** on the conso
 #!/bin/sh
 # /usr/local/sbin/opencloud-backup — run from cron as root, from a clone of this repository
 set -eu
-cd /path/to/open-cloud
+cd /path/to/opencloud
 set -a; . ./.env; set +a
 token=$(cat "$OC_ROOT/secrets/platform/agent-token")
 docker run --rm --network oc_control curlimages/curl -fsS --max-time 3600 \
