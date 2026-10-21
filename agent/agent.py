@@ -1,9 +1,9 @@
 """Open Cloud deployer: the only component with the Docker socket.
 
-Builds an app image, starts the container, stops it, and rolls back to an
-earlier image. The container name is oc-agent. It listens on an internal-only
-network. Every request needs a generated token. It exposes a fixed set of
-actions; it never runs caller-supplied commands.
+Builds an app image, starts the container, stops it, rolls it back to an
+earlier image, and deletes one app. The container name is oc-agent. It listens
+on an internal-only network. Every request needs a generated token. It exposes
+a fixed set of actions; it never runs caller-supplied commands.
 """
 import calendar, copy, hashlib, hmac, json, os, re, secrets, shutil, socket, subprocess, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -67,9 +67,17 @@ def run(args, timeout=900, check=True, **kw):
     return r
 
 
-def app_dir(name):
+def valid_app_name(name):
+    """One path component. Names starting with `site-` are edge files, not apps."""
+    if isinstance(name, str) and name.startswith("site-") and NAME.match(name):
+        raise Bad("invalid app name: the site- prefix is reserved for edge files")
     if not NAME.match(name or "") or name in RESERVED:
         raise Bad("invalid app name")
+    return name
+
+
+def app_dir(name):
+    valid_app_name(name)
     return ROOT / "apps" / name
 
 
@@ -457,8 +465,8 @@ def hosts(app):
     return [f"{app['name']}.{APPS_DOMAIN}"] + route_cfg(app)["domains"]
 
 
-def render_site(app):
-    """Caddy site block, built only from validated structured fields."""
+def render_site_body(app):
+    """Caddy site block, built only from validated structured fields. No ownership line."""
     n, r, port = app["name"], route_cfg(app), app["port"]
     hs = hosts(app)
     addrs = hs + ([] if r["redirect"] else [f"http://{h}" for h in hs])
@@ -473,6 +481,15 @@ def render_site(app):
     if r["health_path"]:
         lines += [f"\t\thealth_uri {r['health_path']}", f"\t\thealth_interval {r['health_interval']}s"]
     return "\n".join(lines + ["\t}", "}", ""])
+
+
+def route_marker(name):
+    """First line of an edge file this deployer wrote for this app."""
+    return f"# opencloud:app={name}"
+
+
+def render_site(app):
+    return route_marker(app["name"]) + "\n" + render_site_body(app)
 
 
 def visibility(app):
@@ -498,15 +515,16 @@ def set_visibility(body, name):
 
 def route(app):
     """Write the site, `caddy validate`, reload; restore the previous file on any failure.
-    Internal apps get no site file (an existing one is removed)."""
+    Internal apps get no site file. Only a file this deployer wrote is removed."""
     if EDGE_MODE == "external":
         return  # the external proxy owns routing; Open Cloud writes no Caddy config
-    site = ROOT / "caddy" / "sites" / f"{app['name']}.caddy"
+    valid_app_name(app["name"])
+    site = route_path(app["name"])
     if visibility(app) == "internal":
-        if site.exists():
-            site.unlink()
-            run(["docker", "exec", EDGE, "caddy", "reload", "--config", "/etc/caddy/Caddyfile"], timeout=60)
+        remove_route(app["name"], app)
         return
+    if site.is_symlink() or (site.exists() and not site.is_file()):
+        raise Bad("refusing unexpected route path")
     old = site.read_text() if site.exists() else None
     site.write_text(render_site(app))
     try:
@@ -734,11 +752,11 @@ def start_job(kind, name, fn, *args):
             job["status"], job["error"] = "failed", str(e)[-1500:]
         finally:
             job["finished"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            # Release the app lock before publishing the final status, so anyone who
-            # sees "succeeded"/"failed" can immediately start the next job.
+            # Publish the final status before releasing the app, so a delete cannot
+            # mark the job and then lose that mark to this write.
             with LOCK:
+                path.write_text(json.dumps(job))
                 BUSY.discard(name)
-            path.write_text(json.dumps(job))
     threading.Thread(target=work, daemon=True).start()
     return job
 
@@ -1703,6 +1721,902 @@ def site_delete(body, name):
     return {"ok": True}
 
 
+# ---- Delete one app -------------------------------------------------------------------------------
+# The console asks; this is the only place that removes anything. Every path is one validated app
+# name under OC_ROOT. External data mounts and hand-written edge files are reported and left alone.
+# Safe to run again after a partial failure: each step treats "already gone" as success.
+
+
+def want_backup(body):
+    if "backup" not in body:
+        return True
+    v = body.get("backup")
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "off", "no", "")
+    return bool(v)
+
+
+def assert_under_root(path):
+    """Refuse a path that resolves outside OC_ROOT (symlink escape or traversal)."""
+    root = ROOT.resolve()
+    if path.exists() or path.is_symlink():
+        real = path.resolve()
+    else:
+        real = path.parent.resolve() / path.name
+    if real != root and root not in real.parents:
+        raise Bad("refusing path outside Open Cloud")
+    return path
+
+
+def managed_child(kind, name):
+    """ROOT/<kind>/<name> for this app only. `name` is a single path component."""
+    if kind not in ("apps", "data", "pgdata", "releases"):
+        raise Bad("refusing unmanaged path")
+    valid_app_name(name)
+    parent = ROOT / kind
+    path = parent / name
+    if path.parent != parent:
+        raise Bad("refusing path outside Open Cloud")
+    assert_under_root(parent)
+    if path.is_symlink():
+        return path
+    if path.exists():
+        assert_under_root(path)
+        if path.resolve().parent != parent.resolve():
+            raise Bad("refusing path outside Open Cloud")
+    return path
+
+
+def remove_managed(kind, name):
+    """Remove a managed directory. A symlink is unlinked and its target is not followed."""
+    path = managed_child(kind, name)
+    if not path.exists() and not path.is_symlink():
+        return "absent", ""
+    if path.is_symlink():
+        target = os.readlink(path)
+        path.unlink()
+        return "removed", f"symlink unlinked; left in place: {target}"
+    if path.is_file():
+        path.unlink()
+        return "removed", ""
+    shutil.rmtree(path)
+    return "removed", ""
+
+
+def db_secret_path(filename):
+    if not re.fullmatch(r"[a-z][a-z0-9-]{1,40}", filename or ""):
+        raise Bad("invalid database credential name")
+    parent = ROOT / "secrets" / "db"
+    path = parent / filename
+    if path.parent != parent:
+        raise Bad("refusing path outside Open Cloud")
+    assert_under_root(parent)
+    if path.is_symlink():
+        return path
+    if path.exists():
+        assert_under_root(path)
+        if path.resolve().parent != parent.resolve():
+            raise Bad("refusing path outside Open Cloud")
+    return path
+
+
+def other_db_secret_users(filename, deleting):
+    """Other apps that still use this secrets/db file (owner password, or a runtime password)."""
+    users = []
+    if filename != deleting and NAME.match(filename) and filename not in RESERVED:
+        if (ROOT / "apps" / filename / "app.json").exists():
+            users.append(filename)
+    if filename.endswith("-runtime"):
+        base = filename[:-len("-runtime")]
+        if base != deleting and NAME.match(base) and base not in RESERVED and (ROOT / "apps" / base / "app.json").exists():
+            users.append(base)
+    return users
+
+
+def load_optional(name):
+    p = app_dir(name) / "app.json"
+    if not p.is_file():
+        return None
+    return json.loads(p.read_text())
+
+
+def lock_down(path):
+    """0700 directories and 0600 files. Symlinks are left unchanged so their targets are not chmod'd."""
+    if path.is_symlink():
+        return
+    os.chmod(path, 0o700 if path.is_dir() else 0o600)
+    if path.is_dir():
+        for child in path.rglob("*"):
+            if child.is_symlink():
+                continue
+            os.chmod(child, 0o700 if child.is_dir() else 0o600)
+
+
+def new_backup_dir(name):
+    parent = ROOT / "backups" / "deleted"
+    assert_under_root(ROOT / "backups")
+    parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(parent, 0o700)
+    assert_under_root(parent)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    dest = parent / f"{name}-{stamp}"
+    if dest.exists():
+        dest = parent / f"{name}-{stamp}-{time.time_ns()}"
+    assert_under_root(dest)
+    dest.mkdir(mode=0o700)
+    os.chmod(dest, 0o700)
+    marker = dest / "INCOMPLETE"
+    marker.write_text("backup did not finish\n")
+    os.chmod(marker, 0o600)
+    return dest
+
+
+def mark_incomplete(dest, err):
+    """A failed backup must not look like a finished one. The app is still on the server."""
+    marker = dest / "INCOMPLETE"
+    marker.write_text("backup did not finish\n" + str(err).replace("\n", " ")[:300] + "\n")
+    os.chmod(marker, 0o600)
+    renamed = dest.with_name(dest.name + "-incomplete")
+    if renamed.exists() or renamed.is_symlink():
+        return dest
+    dest.rename(renamed)
+    return renamed
+
+
+def database_dump(name):
+    """pg_dump of this app's database only, as the owner role `app`.
+
+    None when that container does not exist. A container is used only when its name,
+    compose project, backup label, image, and POSTGRES_USER all belong to this app.
+    """
+    valid_app_name(name)
+    container = f"oc-app-{name}-db-1"
+    if not re.fullmatch(rf"oc-app-{re.escape(name)}-db-1", container):
+        raise Bad("refusing database container")
+    fmt = ("{{.Name}}\t{{.State.Status}}\t{{index .Config.Labels \"com.docker.compose.project\"}}\t"
+           "{{index .Config.Labels \"opencloud.backup\"}}\t{{.Config.Image}}\n"
+           "{{range .Config.Env}}{{println .}}{{end}}")
+    state = run(["docker", "inspect", "-f", fmt, container], check=False)
+    if state.returncode:
+        return None
+    lines = state.stdout.splitlines()
+    fields = lines[0].split("\t") if lines else []
+    if len(fields) != 5:
+        raise Bad("refusing database container")
+    cname, status, project, label, image = fields
+    if cname.startswith("/"):
+        cname = cname[1:]
+    image_name = image.rsplit("/", 1)[-1]
+    if (cname != container or project != f"oc-app-{name}" or label != "postgres"
+            or not (image_name.startswith("postgres:") or image_name.startswith("postgres@"))
+            or "POSTGRES_USER=app" not in lines[1:]):
+        raise Bad("refusing database container")
+    if status != "running":
+        run(["docker", "start", container], timeout=120)
+    return run(["docker", "exec", container, "pg_dump", "-U", "app", "--no-password", "-d", "app"], timeout=600).stdout
+
+
+def action_bucket(action):
+    """Bucket named by Read, Write, List, Tagging, or Admin on that bucket. Bare Admin is not a bucket."""
+    kind, sep, bucket = str(action).partition(":")
+    if sep != ":" or kind not in ("Read", "Write", "List", "Tagging", "Admin"):
+        return None
+    if not BUCKET.match(bucket) or bucket == SITE_BUCKET:
+        return None
+    return bucket
+
+
+def identity_buckets(ident):
+    out = []
+    for action in ident.get("actions") or []:
+        bucket = action_bucket(action)
+        if bucket and bucket not in out:
+            out.append(bucket)
+    return out
+
+
+def app_identity(cfg, name):
+    return next((i for i in cfg.get("identities", []) if i.get("name") == "app-" + name), None)
+
+
+def shared_bucket_names(cfg, name):
+    """Buckets this app shares with another identity. Bare Admin and the `sites` bucket do not count."""
+    ident = app_identity(cfg, name)
+    if not ident:
+        return []
+    mine = set(identity_buckets(ident))
+    others = set()
+    for i in cfg.get("identities", []):
+        if i.get("name") == "app-" + name:
+            continue
+        others.update(identity_buckets(i))
+    return sorted(mine & others)
+
+
+def shared_buckets(name):
+    path = s3_config_path()
+    if not path.is_file():
+        return []
+    return shared_bucket_names(s3_config(), name)
+
+
+def publish_s3(cfg):
+    tmp = s3_config_path().with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2))
+    os.chmod(tmp, 0o600)
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        os.chown(tmp, 1000, 1000)  # SeaweedFS image user
+    tmp.replace(s3_config_path())
+
+
+def bucket_shell(bucket, script):
+    if not BUCKET.match(bucket) or bucket == SITE_BUCKET or "/" in bucket or ".." in bucket:
+        raise Bad("refusing to touch this bucket")
+    return ["docker", "exec", "-i", STORAGE, "weed", "shell"], script
+
+
+FILER_LIST_LIMIT = 1000
+FILER_MODE_DIR = 1 << 31
+FILER_MODE_SYMLINK = 1 << 27
+
+
+def storage_run(argv, timeout=600):
+    """Run a command inside the storage container. The filer there is only on loopback."""
+    cmd = ["docker", "exec", STORAGE, *argv]
+    guard(cmd)
+    return subprocess.run(cmd, capture_output=True, timeout=timeout)
+
+
+def filer_http_url(path, query=None):
+    """Filer URL for one absolute path. Each component is encoded; the path is not a shell string."""
+    from urllib.parse import quote, urlencode
+    if not path.startswith("/") or "\x00" in path:
+        raise Bad("refusing unexpected object path")
+    parts = path.split("/")
+    if any(p in (".", "..") for p in parts):
+        raise Bad("refusing unexpected object path")
+    url = "http://127.0.0.1:8888" + "/".join(quote(p, safe="") for p in parts)
+    if query:
+        url += "?" + urlencode(query)
+    return url
+
+
+def filer_request(path, query=None):
+    """GET one filer path. Directory listings ask for JSON; file bodies come back as bytes."""
+    # -q would hide the 404 text, and a missing bucket must be told apart from any other failure.
+    argv = ["wget", "-O", "-", "--header", "Accept: application/json"]
+    if not query:
+        argv = ["wget", "-O", "-"]
+    return storage_run([*argv, filer_http_url(path, query)])
+
+
+def filer_missing(proc):
+    blob = ((proc.stderr or b"") + (proc.stdout or b"")).decode(errors="replace").lower()
+    return proc.returncode != 0 and any(s in blob for s in ("404", "not found", "no such", "no entry"))
+
+
+def list_filer_dir(path):
+    """Every direct child of a filer directory. None when the directory does not exist."""
+    entries, last, seen = [], "", set()
+    while True:
+        query = {"limit": str(FILER_LIST_LIMIT)}
+        if last:
+            query["lastFileName"] = last
+        proc = filer_request(path, query)
+        if proc.returncode:
+            if not entries and filer_missing(proc):
+                return None
+            err = (proc.stderr or b"").decode(errors="replace")
+            raise Bad("bucket list failed: " + err[-300:])
+        try:
+            data = json.loads(proc.stdout.decode())
+        except ValueError:
+            raise Bad("bucket list was not JSON")
+        entries.extend(data.get("Entries") or [])
+        if not data.get("ShouldDisplayLoadMore"):
+            return entries
+        last = str(data.get("LastFileName") or "")
+        if not last or last in seen:
+            raise Bad("bucket listing did not advance")
+        seen.add(last)
+
+
+def object_key(bucket, full):
+    """Key relative to /buckets/<bucket>. Rejects anything that could leave that tree."""
+    root = f"/buckets/{bucket}"
+    if not isinstance(full, str) or full == root or not full.startswith(root + "/") or "\x00" in full:
+        raise Bad("refusing unexpected object path")
+    key = full[len(root) + 1:]
+    parts = key.split("/")
+    if not parts or any(p in ("", ".", "..") for p in parts):
+        raise Bad("refusing unsafe object key")
+    return key
+
+
+def object_dest(dest, bucket, key, directory):
+    """dest/<bucket>/<key>, created only under dest. A symlink is never followed."""
+    root = dest.resolve()
+    path = dest / bucket
+    path.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink() or path.resolve() != root and root not in path.resolve().parents:
+        raise Bad("refusing path outside the backup")
+    for i, part in enumerate(key.split("/")):
+        path = path / part
+        if path.is_symlink():
+            raise Bad("refusing unsafe object key")
+        real = path.resolve() if path.exists() else path.parent.resolve() / path.name
+        if root not in real.parents:
+            raise Bad("refusing path outside the backup")
+        last = i == key.count("/")
+        if directory or not last:
+            path.mkdir(exist_ok=True)
+            if path.is_symlink() or not path.is_dir():
+                raise Bad("refusing unsafe object key")
+    return path
+
+
+def save_object(dest, bucket, key, body, size):
+    path = object_dest(dest, bucket, key, directory=False)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "wb") as out:
+        out.write(body)
+    if path.is_symlink() or path.stat().st_size != size or len(body) != size:
+        path.unlink(missing_ok=True)
+        raise Bad("bucket object size did not match")
+    return path
+
+
+def export_bucket(bucket, dest):
+    """Download every object in one bucket. Never the shared sites bucket.
+
+    `weed filer.copy` only uploads into the filer, so this reads the filer over its
+    loopback HTTP port inside the storage container. Keys stay under dest/<bucket>/.
+    """
+    bucket_shell(bucket, "")
+    root = f"/buckets/{bucket}"
+    entries = list_filer_dir(root)
+    if entries is None:
+        return "absent"
+
+    def walk(directory, children):
+        for entry in children:
+            full = entry.get("FullPath")
+            key = object_key(bucket, full)
+            if not full.startswith(directory.rstrip("/") + "/"):
+                raise Bad("refusing unexpected object path")
+            mode = int(entry.get("Mode") or 0)
+            if mode & FILER_MODE_SYMLINK or entry.get("SymlinkTarget"):
+                raise Bad("refusing symlink in bucket")
+            if mode & FILER_MODE_DIR:
+                object_dest(dest, bucket, key, directory=True)
+                nested = list_filer_dir(full)
+                if nested is None:
+                    raise Bad("bucket folder disappeared during backup")
+                walk(full, nested)
+                continue
+            proc = filer_request(full)
+            if proc.returncode:
+                err = (proc.stderr or b"").decode(errors="replace")
+                raise Bad("bucket object download failed: " + err[-300:])
+            save_object(dest, bucket, key, proc.stdout, int(entry.get("FileSize") or 0))
+
+    walk(root, entries)
+    (dest / bucket).mkdir(parents=True, exist_ok=True)
+    return "ok"
+
+
+def safe_extract_tar(blob, bucket, dest):
+    """Unpack a bucket archive. Members must stay inside dest/<bucket>."""
+    import io, tarfile
+    dest.mkdir(parents=True, exist_ok=True)
+    root = dest.resolve()
+    try:
+        tar = tarfile.open(fileobj=io.BytesIO(blob), mode="r:")
+    except tarfile.TarError:
+        raise Bad("bucket export was not a tar archive")
+    with tar:
+        for member in tar.getmembers():
+            name = member.name
+            if member.issym() or member.islnk() or name.startswith("/") or ".." in name.split("/"):
+                raise Bad("refusing unsafe path in bucket export")
+            if name != bucket and not name.startswith(bucket + "/"):
+                raise Bad("refusing unexpected path in bucket export")
+            target = (dest / name).resolve()
+            if target != root and root not in target.parents:
+                raise Bad("refusing path outside the backup")
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if not member.isfile():
+                raise Bad("refusing special file in bucket export")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            src = tar.extractfile(member)
+            if src is None:
+                raise Bad("bucket export entry is unreadable")
+            target.write_bytes(src.read())
+    return "ok"
+
+
+def remove_bucket(bucket):
+    args, script = bucket_shell(bucket, f"fs.rm -r /buckets/{bucket}\ns3.bucket.delete -name {bucket}\n")
+    result = run(args, input=script, timeout=120, check=False)
+    if result.returncode:
+        err = (result.stdout + result.stderr).lower()
+        if not any(s in err for s in ("no such", "not found", "no entry", "not exist", "does not exist")):
+            raise Bad("bucket delete failed: " + (result.stderr or result.stdout)[-300:])
+    return "removed"
+
+
+def copy_managed_data(name, dest):
+    src = managed_child("data", name)
+    if not src.exists() and not src.is_symlink():
+        return "absent"
+    if src.is_symlink():
+        (dest / "data-symlink.txt").write_text(f"symlink left unfollowed: {os.readlink(src)}\n")
+        return "symlink"
+    shutil.copytree(src, dest / "data", symlinks=True, dirs_exist_ok=True)
+    return "ok"
+
+
+def take_backup(name, app):
+    """Final copy: app definition, database dump, bucket objects, and managed /data. No secret files."""
+    pg = managed_child("pgdata", name)
+    data = managed_child("data", name)
+    has_db_files = pg.exists() or db_secret_path(name).exists() or db_secret_path(f"{name}-runtime").exists()
+    buckets = []
+    if s3_config_path().is_file() and app_identity(s3_config(), name):
+        buckets = [b for b in identity_buckets(app_identity(s3_config(), name)) if b != SITE_BUCKET and BUCKET.match(b)]
+    has_data = data.exists() or data.is_symlink()
+    if not app and not has_db_files and not buckets and not has_data:
+        return None, [{"step": "backup", "status": "absent", "detail": "nothing left to back up"}]
+    dest = new_backup_dir(name)
+    final = dest
+    try:
+        try:
+            if app:
+                (dest / "app.json").write_text(json.dumps({k: v for k, v in app.items() if k != "secrets"}, indent=2))
+            if (app and app.get("db")) or has_db_files:
+                dump = database_dump(name)
+                if dump is None and has_db_files:
+                    raise Bad("database files exist but the database container could not be dumped")
+                if dump is not None:
+                    (dest / "database.sql").write_text(dump)
+            for bucket in buckets:
+                export_bucket(bucket, dest / "buckets")
+            if has_data:
+                copy_managed_data(name, dest)
+            (dest / "INCOMPLETE").unlink()
+            return str(dest), [{"step": "backup", "status": "ok", "detail": str(dest)}]
+        except Exception as err:
+            final = mark_incomplete(dest, err)
+            detail = str(err).replace("\n", " ")[:200]
+            raise Bad(f"partial backup kept at {final}: {detail}")
+    finally:
+        if final.exists():
+            lock_down(final)
+
+
+def route_path(name):
+    """caddy/sites/<name>.caddy. `name` is one path component; the file may be hand-written."""
+    if not NAME.match(name or ""):
+        raise Bad("invalid app name")
+    sites = ROOT / "caddy" / "sites"
+    site = sites / f"{name}.caddy"
+    if site.parent != sites:
+        raise Bad("refusing path outside Open Cloud")
+    assert_under_root(sites)
+    return site
+
+
+def route_owned(name, site, app):
+    """True when this regular file was written for this app. A `site-*` file is never owned."""
+    if name.startswith("site-") or name in RESERVED or site.is_symlink() or not site.is_file():
+        return False
+    try:
+        text = site.read_text()
+    except OSError:
+        return False
+    lines = text.splitlines()
+    if lines and lines[0] == route_marker(name):
+        return True
+    # Apps deployed before the marker: the file is owned only when it is still the generated route.
+    return bool(app) and app.get("name") == name and text == render_site_body(app)
+
+
+def remove_route(name, app=None):
+    """Remove the edge file only when this deployer wrote it for this app. Anything else stays."""
+    site = route_path(name)
+    if not site.exists() and not site.is_symlink():
+        return "absent", ""
+    if not route_owned(name, site, app):
+        return "kept", site.name
+    old = site.read_text()
+    site.unlink()
+    if EDGE_MODE == "external":
+        return "removed", site.name
+    try:
+        run(["docker", "exec", EDGE, "caddy", "reload", "--config", "/etc/caddy/Caddyfile"], timeout=60)
+    except Bad as err:
+        site.write_text(old)
+        raise Bad("route removal rejected by Caddy and restored: " + str(err)[-200:])
+    return "removed", site.name
+
+
+def hand_routes(name):
+    """Hand-written edge files that still proxy to this app. Listed, never edited."""
+    found = []
+    sites = ROOT / "caddy" / "sites"
+    if not sites.is_dir():
+        return found
+    for f in sorted(sites.glob("site-*.caddy")):
+        try:
+            text = f.read_text()
+        except OSError:
+            continue
+        if re.search(rf"(^|\s)app-{re.escape(name)}(:|\s|$)", text):
+            found.append(f.name)
+    return found
+
+
+def compose_down(name):
+    """Stop this app's compose project only. External networks joined by the app are not removed."""
+    project = f"oc-app-{name}"
+    if not re.fullmatch(rf"oc-app-{re.escape(name)}", project):
+        raise Bad("refusing compose project")
+    compose_file = managed_child("apps", name) / "compose.yaml"
+    if compose_file.is_file() and not compose_file.is_symlink():
+        run(["docker", "compose", "-f", str(compose_file), "-p", project, "down", "-v", "--remove-orphans"], timeout=300)
+        return "removed", project
+    listed = run(["docker", "ps", "-a", "--filter", f"label=com.docker.compose.project={project}", "--format", "{{.Names}}"], check=False)
+    if listed.returncode:
+        raise Bad("listing app containers failed: " + (listed.stderr or "")[-200:])
+    names = [n for n in listed.stdout.split() if n]
+    for n in names:
+        if not re.fullmatch(rf"oc-app-{re.escape(name)}-(web|db|prev)-[0-9]+", n):
+            raise Bad(f"refusing to remove unexpected container {n}")
+    if names:
+        run(["docker", "rm", "-f", *names], timeout=180)
+    net = run(["docker", "network", "rm", f"{project}_db"], check=False)
+    blob = ((net.stdout or "") + (net.stderr or "")).lower()
+    missing = net.returncode != 0 and any(s in blob for s in ("not found", "no such", "not exist"))
+    if net.returncode and not missing:
+        raise Bad("removing the app network failed: " + (net.stderr or net.stdout or "")[-200:])
+    if names or net.returncode == 0:
+        return "removed", project
+    return "absent", project
+
+
+def remove_images(name):
+    """Remove images whose repository is exactly oc-app-<name>. Other repositories are left alone."""
+    repo = f"oc-app-{name}"
+    listed = run(["docker", "image", "ls", "--format", "{{.Repository}}\t{{.Tag}}\t{{.ID}}"], check=False)
+    if listed.returncode:
+        raise Bad("listing images failed: " + (listed.stderr or "")[-200:])
+    targets = []
+    for line in listed.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3 or parts[0] != repo:
+            continue
+        if parts[1] == "<none>":
+            if not re.fullmatch(r"(sha256:)?[0-9a-f]{12,64}", parts[2]):
+                raise Bad("refusing to remove image")
+            ref = parts[2]
+        else:
+            if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", parts[1]):
+                raise Bad("refusing to remove image")
+            ref = f"{repo}:{parts[1]}"
+        if ref not in targets:
+            targets.append(ref)
+    for ref in targets:
+        run(["docker", "image", "rm", "-f", ref], timeout=180)
+    return ("removed" if targets else "absent"), " ".join(targets)
+
+
+def remove_database_files(name):
+    removed, kept = [], []
+    for filename in (name, f"{name}-runtime"):
+        others = other_db_secret_users(filename, name)
+        path = db_secret_path(filename)
+        if others:
+            kept.append(f"{filename} (also used by {', '.join(others)})")
+            continue
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+            removed.append(filename)
+        elif path.exists():
+            raise Bad("refusing unexpected database credential path")
+    data, data_detail = remove_managed("pgdata", name)
+    detail = " ".join(removed)
+    if data == "removed":
+        detail = (detail + " pgdata").strip()
+    if data_detail:
+        kept.append(data_detail)
+    status = "removed" if removed or data == "removed" else "absent"
+    return status, detail, kept
+
+
+def storage_restart_flag():
+    return ROOT / "secrets" / "storage" / "restart-required"
+
+
+def remove_app_buckets(name):
+    """Delete buckets only this app's key can use, then drop that identity. `sites` and other keys stay."""
+    path = s3_config_path()
+    if not path.is_file():
+        return "absent", ""
+    with LOCK:
+        cfg = s3_config()
+        ident = app_identity(cfg, name)
+        if not ident:
+            return "absent", ""
+        buckets = identity_buckets(ident)
+        shared = shared_bucket_names(cfg, name)
+        if shared:
+            raise Bad("refusing to delete buckets still used by another identity: " + " ".join(shared))
+    for bucket in buckets:
+        remove_bucket(bucket)
+    with LOCK:
+        cfg = s3_config()
+        ident = app_identity(cfg, name)
+        if ident:
+            extra = [b for b in identity_buckets(ident) if b not in buckets]
+            if extra or shared_bucket_names(cfg, name):
+                raise Bad("storage config changed during delete; run delete again")
+        before = len(cfg.get("identities", []))
+        cfg["identities"] = [i for i in cfg.get("identities", []) if i.get("name") != "app-" + name]
+        changed = len(cfg["identities"]) != before
+        if changed:
+            publish_s3(cfg)
+            flag = storage_restart_flag()
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.write_text(name)
+    return ("removed" if buckets or changed else "absent"), " ".join(buckets)
+
+
+def restart_storage_if_needed():
+    """Finish an identity change, including one whose restart failed on an earlier attempt."""
+    flag = storage_restart_flag()
+    if not flag.exists():
+        return "absent", ""
+    restart_storage()
+    flag.unlink(missing_ok=True)
+    return "restarted", STORAGE
+
+
+def forget_gateway_app(name):
+    """Drop this app's gateway client file and its name on endpoints. Endpoints themselves stay."""
+    removed = False
+    parent = ROOT / "secrets" / "gateway-clients"
+    path = parent / name
+    if parent.is_dir() and path.parent == parent:
+        assert_under_root(parent)
+        if path.is_symlink() or path.is_file():
+            if path.is_symlink():
+                path.unlink()
+            else:
+                assert_under_root(path)
+                path.unlink()
+            removed = True
+        elif path.exists():
+            raise Bad("refusing unexpected gateway client path")
+    cfg_path = gw_dir() / "config.json"
+    if cfg_path.is_file():
+        with LOCK:
+            cfg = gw_config()
+            changed = False
+            for ep in cfg.get("endpoints", {}).values():
+                apps = ep.get("apps") or []
+                if name in apps:
+                    ep["apps"] = [a for a in apps if a != name]
+                    changed = True
+            if changed:
+                try:
+                    gw_save(cfg)
+                except PermissionError:  # not root: tests, and a deployer that cannot chown
+                    (gw_dir() / "config.json.tmp").unlink(missing_ok=True)
+                    cfg_path.write_text(json.dumps(cfg, indent=2))
+                removed = True
+    return ("removed" if removed else "absent"), ""
+
+
+def outside_mounts(app):
+    """Host paths this app mounted. They are not under the app's managed directories and are not deleted."""
+    if not app:
+        return []
+    kept = []
+    for mount in app.get("data_mounts") or []:
+        src, tgt = mount.get("source", ""), mount.get("target", "")
+        if src:
+            kept.append({"step": "data_mount", "status": "kept", "detail": f"{src}:{tgt}" if tgt else src})
+    for mount in app.get("secret_mounts") or []:
+        src = mount.get("source", "")
+        if src:
+            kept.append({"step": "secret_mount", "status": "kept", "detail": src})
+    return kept
+
+
+def delete_marker(name, filename):
+    """releases/<name>/<filename> when that directory is a real directory. Symlinks do not count."""
+    rel = managed_child("releases", name)
+    if rel.is_symlink() or not rel.is_dir():
+        return None
+    path = rel / filename
+    if path.parent != rel or path.is_symlink() or not path.is_file():
+        return None
+    return path
+
+
+def recorded_delete(name):
+    """True when this deployer already started or finished deleting this app."""
+    return delete_marker(name, "DELETING") is not None or delete_marker(name, "DELETED") is not None
+
+
+def delete_target_exists(name):
+    """An app definition, an app folder, or a delete this deployer already recorded."""
+    d = app_dir(name)
+    if (d / "app.json").is_file() or d.exists() or d.is_symlink():
+        return True
+    return recorded_delete(name)
+
+
+def begin_delete(name):
+    """Remember that a delete has started, so a later run can finish after the app folder is gone."""
+    if delete_marker(name, "DELETED"):
+        return
+    rel = managed_child("releases", name)
+    if rel.is_symlink():
+        raise Bad("refusing unexpected releases path")
+    rel.mkdir(parents=True, exist_ok=True)
+    marker = rel / "DELETING"
+    if marker.is_symlink() or (marker.exists() and not marker.is_file()):
+        raise Bad("refusing unexpected delete marker")
+    if marker.is_file():
+        return
+    marker.write_text(json.dumps({"deleting": True, "app": name,
+                                   "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}))
+    os.chmod(marker, 0o600)
+
+
+def mark_deleted(name, app, backup_path):
+    """Keep release records and jobs. Mark them so the console can show the app is gone."""
+    rel = managed_child("releases", name)
+    if rel.is_symlink():
+        raise Bad("refusing unexpected releases path")
+    rel.mkdir(parents=True, exist_ok=True)
+    when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    marker = rel / "DELETED"
+    if marker.is_symlink():
+        raise Bad("refusing unexpected delete marker")
+    already = marker.is_file()
+    marker.write_text(json.dumps({"deleted": True, "app": name, "time": when, "backup": backup_path or ""}))
+    os.chmod(marker, 0o600)
+    deleting = rel / "DELETING"
+    if deleting.is_file() and not deleting.is_symlink():
+        deleting.unlink()
+    if not already:
+        record_app = {"name": name, "image_tag": (app or {}).get("image_tag") or "", "commit": (app or {}).get("commit") or "",
+                      "repo": (app or {}).get("repo") or (app or {}).get("folder") or ""}
+        record(record_app, "delete")
+    jobs_dir = ROOT / "jobs"
+    with LOCK:
+        if jobs_dir.is_dir():
+            for p in jobs_dir.glob("*.json"):
+                try:
+                    job = json.loads(p.read_text())
+                except ValueError:
+                    continue
+                if job.get("app") == name and not job.get("app_deleted"):
+                    job["app_deleted"] = True
+                    p.write_text(json.dumps(job))
+    return "kept", "jobs and release records marked deleted" if not already else "already marked deleted"
+
+
+def perform(steps, step, fn):
+    try:
+        status, detail = fn()
+    except Bad as err:
+        steps.append({"step": step, "status": "failed", "detail": str(err)[:300]})
+        raise
+    steps.append({"step": step, "status": status, "detail": detail or ""})
+    return status
+
+
+def delete_app(body, name):
+    app_dir(name)  # validates the name; no traversal, no reserved names
+    if str(body.get("confirm", "")) != name:
+        raise Bad("type the app name to confirm")
+    with LOCK:
+        if name in BUSY:
+            raise Bad("a build or deploy is already running for this app")
+        BUSY.add(name)
+    try:
+        return do_delete(name, want_backup(body))
+    finally:
+        with LOCK:
+            BUSY.discard(name)
+
+
+def do_delete(name, backup):
+    if not delete_target_exists(name):
+        raise Bad("no such app")
+    app = load_optional(name)
+    shared = shared_buckets(name)
+    if shared:
+        raise Bad("refusing to delete buckets still used by another identity: " + " ".join(shared))
+    steps = []
+    backup_path = None
+    try:
+        if backup:
+            backup_path, bsteps = take_backup(name, app)
+            steps.extend(bsteps)
+        else:
+            steps.append({"step": "backup", "status": "skipped", "detail": "backup off"})
+    except Bad as err:
+        if not any(s["step"] == "backup" and s["status"] == "failed" for s in steps):
+            steps.append({"step": "backup", "status": "failed", "detail": str(err)[:300]})
+        audit_append({"event": "app-delete", "ip": "agent", "target": f"app={name}", "outcome": "error: " + str(err)[:200]})
+        raise Bad("backup failed, app was not deleted: " + str(err)[:300])
+    try:
+        begin_delete(name)
+        perform(steps, "route", lambda: remove_route(name, app))
+        for filename in hand_routes(name):
+            steps.append({"step": "hand_route", "status": "kept", "detail": filename})
+        steps.extend(outside_mounts(app))
+        perform(steps, "compose", lambda: compose_down(name))
+        perform(steps, "images", lambda: remove_images(name))
+        try:
+            status, detail, kept = remove_database_files(name)
+        except Bad as err:
+            steps.append({"step": "database", "status": "failed", "detail": str(err)[:300]})
+            raise
+        steps.append({"step": "database", "status": status, "detail": detail})
+        for item in kept:
+            steps.append({"step": "database_credential", "status": "kept", "detail": item})
+        try:
+            status, detail = remove_app_buckets(name)
+        except Bad as err:
+            steps.append({"step": "buckets", "status": "failed", "detail": str(err)[:300]})
+            raise
+        steps.append({"step": "buckets", "status": status, "detail": detail})
+        perform(steps, "storage", restart_storage_if_needed)
+        perform(steps, "gateway", lambda: forget_gateway_app(name))
+        perform(steps, "secrets", lambda: (remove_managed_secrets(name), ""))
+        perform(steps, "data", lambda: remove_managed("data", name))
+        perform(steps, "files", lambda: remove_managed("apps", name))
+        if app or managed_child("releases", name).exists() or any(s["status"] in ("removed", "restarted") for s in steps):
+            perform(steps, "history", lambda: mark_deleted(name, app, backup_path))
+        else:
+            steps.append({"step": "history", "status": "absent", "detail": ""})
+    except Bad as err:
+        summary = ", ".join(f"{s['step']}={s['status']}" for s in steps)
+        audit_append({"event": "app-delete", "ip": "agent", "target": f"app={name}", "outcome": "error: " + str(err)[:200]})
+        raise Bad(str(err)[:300] + (f" [{summary[:300]}]" if summary else ""))
+    outcome = "ok backup=" + (backup_path or ("off" if not backup else "none"))
+    audit_append({"event": "app-delete", "ip": "agent", "target": f"app={name}", "outcome": outcome})
+    return {"ok": True, "app": name, "deleted": True, "backup_path": backup_path, "steps": steps}
+
+
+def remove_managed_secrets(name):
+    parent = ROOT / "secrets" / "apps"
+    path = parent / name
+    valid_app_name(name)
+    if path.parent != parent:
+        raise Bad("refusing path outside Open Cloud")
+    assert_under_root(parent)
+    if not path.exists() and not path.is_symlink():
+        return "absent"
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+        return "removed"
+    if path.resolve().parent != parent.resolve():
+        raise Bad("refusing path outside Open Cloud")
+    shutil.rmtree(path)
+    return "removed"
+
+
 SITE_ROUTES = {"upload": site_upload, "domains": site_domains_set, "delete": site_delete,
                "real-cert": site_real_cert, "www-redirect": site_www_redirect}
 
@@ -1716,7 +2630,7 @@ ROUTES = {
     ("POST", "backup"): backup, ("GET", "backups"): snapshots,
     ("POST", "redeploy"): lambda b, n: deploy(b, n), ("POST", "rollback"): rollback,
     ("POST", "db"): create_db, ("POST", "secrets"): set_secret, ("POST", "ai"): enable_ai, ("POST", "provider-key"): set_provider_key_env, ("POST", "visibility"): set_visibility,
-    ("GET", "logs"): logs, ("GET", "releases"): releases,
+    ("GET", "logs"): logs, ("GET", "releases"): releases, ("POST", "delete"): delete_app,
     ("POST", "buckets"): create_bucket, ("POST", "limits"): set_limits, ("GET", "buckets"): buckets,
     ("GET", "map"): app_map, ("POST", "api-discover"): discover_api, ("POST", "api-endpoint"): add_api_endpoint,
     ("POST", "api-check"): set_api_check, ("POST", "api-probe"): probe_now,

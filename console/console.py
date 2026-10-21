@@ -351,7 +351,8 @@ GUIDE = """<div class=card><b>1. What the repo needs</b><ul>
 <li>A cheap health path, e.g. <code>GET /health</code> &rarr; 200. Set it under <a href="/loadbalancers">Open ELB</a>.</li></ul></div>
 <div class=card><b>2. Steps</b><ol><li><b>Create the app</b>: App Runner &rarr; name, repo, port &rarr; Deploy. New apps are Internal (no public address) unless you pick External. An optional <code>opencloud.json</code> next to the Dockerfile can set a health check and a read-only root.</li>
 <li><b>Add what it needs</b> on the service page: Postgres database, bucket, Open Bedrock, your own secrets. Each one restarts the app with the new values.</li>
-<li><b>Redeploy</b> after pushing code; <b>Roll back</b> to return to the previous image.</li></ol></div>
+<li><b>Redeploy</b> after pushing code; <b>Roll back</b> to return to the previous image.</li>
+<li><b>Delete</b> on the service page removes that app. Type the app name to confirm. A final backup is on unless you turn it off.</li></ol></div>
 <div class=card><b>3. How values arrive: files, not environment variables</b><p>Everything except <code>PORT</code> is a file at <code>/run/secrets/NAME</code> (no trailing newline).</p>
 <table><tr><th>Feature</th><th>File</th><th>Value</th></tr>
 <tr><td>Postgres</td><td><code>DATABASE_URL</code></td><td><code>postgresql://app_runtime:&lt;password&gt;@db:5432/app</code></td></tr>
@@ -513,6 +514,59 @@ def form(action, csrf, inner, label, cls=""):
     return f'<form method=post action="{e(action)}" style="display:inline"><input type=hidden name=csrf value="{e(csrf)}">{inner}<button class="{cls}">{e(label)}</button></form>'
 
 
+def delete_form(app, csrf):
+    """Typed confirmation. The deployer is what actually removes the app."""
+    n = app["name"]
+    kept = []
+    for m in app.get("data_mounts") or []:
+        src, tgt = m.get("source", ""), m.get("target", "")
+        if src:
+            kept.append(f"{src}:{tgt}" if tgt else src)
+    for m in app.get("secret_mounts") or []:
+        if m.get("source"):
+            kept.append(m["source"])
+    if app.get("site_domains"):
+        kept.append("hand-written edge site (" + ", ".join(app["site_domains"]) + ")")
+    left = ("<p>Left in place: " + ", ".join(f"<code>{e(x)}</code>" for x in kept) +
+            ". These are outside this app's managed files and are not deleted.</p>") if kept else (
+            "<p>Host data folders, host secret files, and hand-written edge files are not deleted. This app has none.</p>")
+    inner = (
+        "<p>This removes the app from this server:</p><ul>"
+        "<li>Containers and the app's private network</li>"
+        "<li>Its edge route (the edge is reloaded)</li>"
+        "<li>Its Postgres database, data directory, and credentials</li>"
+        "<li>Its buckets and S3 access key</li>"
+        "<li>Its secret files, managed <code>/data</code> folder, and app folder</li></ul>"
+        "<p>Deploy jobs and release records are kept and marked deleted.</p>" + left +
+        '<p><label><input type=checkbox name=backup value=1 checked> Take a final backup first '
+        "(database dump, bucket objects, app definition, and <code>/data</code>)</label></p>"
+        f'<p><label>Type <code>{e(n)}</code> to confirm <input name=confirm required autocomplete=off size=24></label></p>'
+    )
+    return (f'<div class=card><b>Delete this app</b>'
+            f'<form method=post action="/apps/{e(n)}/delete"><input type=hidden name=csrf value="{e(csrf)}">{inner}'
+            f'<button>Delete app</button></form></div>')
+
+
+def delete_flash(res):
+    """Plain text for the console banner. Paths and mount sources only; never secret values."""
+    parts = [f"Deleted {res.get('app', 'app')}."]
+    parts.append(f"Backup: {res['backup_path']}" if res.get("backup_path") else "No backup was taken.")
+    kept = [s.get("detail") for s in res.get("steps", []) if s.get("status") == "kept" and s.get("detail")]
+    if kept:
+        parts.append("Left in place: " + "; ".join(kept))
+    failed = [s.get("step") for s in res.get("steps", []) if s.get("status") == "failed"]
+    if failed:
+        parts.append("Needs attention: " + ", ".join(failed))
+    return " ".join(parts)[:500]
+
+
+def job_app(j):
+    name = e(j.get("app", ""))
+    if j.get("app_deleted"):
+        return f"{name} <small>(deleted)</small>"
+    return f'<a href="/apps/{name}">{name}</a>'
+
+
 PROVIDER_NAMES = {"openrouter": "OpenRouter", "openai": "OpenAI", "anthropic": "Anthropic Claude"}
 
 
@@ -630,18 +684,19 @@ def view(path, csrf, q=None):
 <div class=card><b>Resources</b> (applied on save; the app restarts): {lim}</div>
 <div class=card><b>Object storage</b> (keys arrive as <code>S3_ACCESS_KEY_ID</code> / <code>S3_SECRET_ACCESS_KEY</code> secrets): {bk}</div>
 <div class=card><b>Releases</b><table><tr><th>Time (UTC)</th><th>Action</th><th>Image</th></tr>{rel}</table></div>
-<div class=card><b>Logs</b> (last 200 lines)<pre>{e(logs)}</pre></div>"""
+<div class=card><b>Logs</b> (last 200 lines)<pre>{e(logs)}</pre></div>
+{delete_form(a, csrf)}"""
     if path == "/storage":
         rows = "".join(f'<tr><td>{e(b["bucket"])}</td><td><a href="/apps/{e(b["app"])}">{e(b["app"])}</a></td></tr>' for b in agent("GET", "/buckets"))
         return "Object Storage", f'<div class=card>S3-compatible API (SeaweedFS). Apps use <code>http://storage:8333</code>; presigned URLs use <code>https://{e(os.environ.get("OC_S3_HOST", ""))}</code>. Each app gets its own access key, limited to its buckets. Create buckets on the service page. Apps also have a persistent <code>/data</code> directory.</div><div class=card><table><tr><th>Bucket</th><th>Owner app</th></tr>{rows or "<tr><td colspan=2>No buckets yet.</td></tr>"}</table></div>'
     if path == "/jobs":
-        rows = "".join(f'<tr><td><a href="/jobs/{e(j["id"])}">{e(j["id"])}</a></td><td>{e(j["kind"])}</td><td>{e(j["app"])}</td><td class={"bad" if j["status"] == "failed" else "ok"}>{e(j["status"])}</td><td>{e(j["started"])}</td></tr>' for j in agent("GET", "/jobs"))
+        rows = "".join(f'<tr><td><a href="/jobs/{e(j["id"])}">{e(j["id"])}</a></td><td>{e(j["kind"])}</td><td>{job_app(j)}</td><td class={"bad" if j["status"] == "failed" else "ok"}>{e(j["status"])}</td><td>{e(j["started"])}</td></tr>' for j in agent("GET", "/jobs"))
         return "Deployments", f'<div class=card><table><tr><th>Job</th><th>Kind</th><th>App</th><th>Status</th><th>Started (UTC)</th></tr>{rows or "<tr><td colspan=5>No jobs yet.</td></tr>"}</table></div>'
     m = re.fullmatch(r"/jobs/([0-9a-f]{1,20})", path)
     if m:
         j = agent("GET", path)
         refresh = '<meta http-equiv=refresh content=3>' if j["status"] == "running" else ""
-        return f"Job {j['id']}", f'{refresh}<div class=card>{e(j["kind"])} of <a href="/apps/{e(j["app"])}">{e(j["app"])}</a>: <b class={"bad" if j["status"] == "failed" else "ok"}>{e(j["status"])}</b> · started {e(j["started"])} · finished {e(j.get("finished", "-"))}</div>' + (f'<div class=card><pre>{e(j["error"])}</pre></div>' if j.get("error") else "")
+        return f"Job {j['id']}", f'{refresh}<div class=card>{e(j["kind"])} of {job_app(j)}: <b class={"bad" if j["status"] == "failed" else "ok"}>{e(j["status"])}</b> · started {e(j["started"])} · finished {e(j.get("finished", "-"))}</div>' + (f'<div class=card><pre>{e(j["error"])}</pre></div>' if j.get("error") else "")
     if path == "/audit":
         a = agent("GET", "/audit")
         rows = "".join(f'<tr><td>{e(x["time"])}</td><td>{e(x["event"])}</td><td>{e(x["target"])}</td><td>{e(x["outcome"])}</td><td>{e(x["ip"])}</td></tr>' for x in a["entries"])
@@ -973,7 +1028,7 @@ class Handler(BaseHTTPRequestHandler):
             except (RuntimeError, OSError) as err:
                 audit("action", ip, target, "error: " + str(err)[:200])
                 return self.redirect("/sites?err=1&msg=" + quote(str(err)[:500]))
-        m = re.fullmatch(r"/apps/([a-z][a-z0-9-]{1,30})/(redeploy|rollback|db|secrets|ai|buckets|limits|route|api-discover|api-endpoint|api-check|api-probe|provider-key|visibility)", path)
+        m = re.fullmatch(r"/apps/([a-z][a-z0-9-]{1,30})/(redeploy|rollback|db|secrets|ai|buckets|limits|route|api-discover|api-endpoint|api-check|api-probe|provider-key|visibility|delete)", path)
         back = ((f"/loadbalancers/{m.group(1)}" if m.group(2) == "route" else f"/apps/{m.group(1)}") if m else "/models" if path.startswith("/gateway/")
                 else "/cloudwatch/notifications" if path.startswith("/cloudwatch/smtp") else "/cloudwatch/events" if path.startswith("/cloudwatch/keys")
                 else "/cloudwatch" if path.startswith("/cloudwatch/") else path)
@@ -990,6 +1045,9 @@ class Handler(BaseHTTPRequestHandler):
                 target += " env=" + f.get("env", "")
             elif m and m.group(2) == "buckets":
                 target += " bucket=" + f.get("bucket", "")
+            elif m and m.group(2) == "delete":
+                # The confirmation box is not logged: a mistype might be a secret pasted into the field.
+                target += " backup=" + ("on" if f.get("backup") else "off")
             elif path == "/apps":
                 target += f" name={f.get('name', '')} repo={f.get('repo', '')} folder={f.get('folder', '')} networks={f.get('networks', '')} mounts={len((f.get('secret_mounts', '') + chr(10) + f.get('data_mounts', '')).split())}"
             elif m and m.group(2) in ("api-discover", "api-endpoint", "api-check"):
@@ -1005,6 +1063,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/gateway/endpoints":
                 target += f" name={f.get('name', '')} model={f.get('model', '')} apps={f.get('apps', '')} rpm={f.get('rpm', '')}" + (" delete" if f.get("delete") else "")
             if m:
+                if m.group(2) == "delete" and f.get("confirm", "") != m.group(1):
+                    raise RuntimeError("Type the app name to confirm deletion.")
                 body = {"secrets": {"key": f.get("key", ""), "value": f.get("value", "")},
                         "route": {k: f.get(k, "") for k in ("domains", "redirect", "health_path", "health_interval", "canary_weight")},
                         "api-discover": {"spec_path": f.get("spec_path", "")},
@@ -1013,8 +1073,15 @@ class Handler(BaseHTTPRequestHandler):
                         "api-probe": {},
                         "provider-key": {"env": f.get("env", "")},
                         "visibility": {"visibility": f.get("visibility", "")},
-                        "limits": {"memory_mb": f.get("memory_mb"), "cpus": f.get("cpus")}}.get(m.group(2), {"bucket": f.get("bucket", "")})
+                        "limits": {"memory_mb": f.get("memory_mb"), "cpus": f.get("cpus")},
+                        "delete": {"confirm": m.group(1), "backup": bool(f.get("backup"))}}.get(m.group(2), {"bucket": f.get("bucket", "")})
                 res = agent("POST", path, body)
+                if m.group(2) == "delete":
+                    try:
+                        watch("POST", "/admin/keys-revoke", {"app": m.group(1)})
+                    except (RuntimeError, OSError):
+                        res = {**res, "steps": list(res.get("steps") or []) + [{"step": "cloudwatch_key", "status": "kept", "detail": "subscriber key revoke failed"}]}
+                    back = "/apps"
             elif path in ACTIONS:
                 res = ACTIONS[path](f)
                 back = f"/apps/{f.get('name')}" if path == "/apps" else back
@@ -1023,7 +1090,8 @@ class Handler(BaseHTTPRequestHandler):
             audit("action", ip, target)
             if isinstance(res, dict) and res.get("status") == "running":
                 return self.redirect(f"/jobs/{res['id']}")
-            self.redirect(back + "?msg=" + quote("Done."))
+            done = delete_flash(res) if isinstance(res, dict) and res.get("deleted") else "Done."
+            self.redirect(back + "?msg=" + quote(done))
         except (RuntimeError, OSError) as err:
             audit("action", ip, target, "error: " + str(err)[:200])
             self.redirect(("/apps" if path == "/apps" else back) + "?err=1&msg=" + quote(str(err)[:500]))

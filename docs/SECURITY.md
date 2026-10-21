@@ -7,7 +7,11 @@
   to the agent over an internal-only network with a generated token.
 - **Agent**: the only container with the Docker socket (so it is root-equivalent on the host). It has no
   ports, is not on the app network, and offers a fixed list of validated actions. It never runs
-  caller-supplied commands. Its action list is the trust boundary.
+  caller-supplied commands. Its action list is the trust boundary. Deleting an app is one action.
+  The console only sends the app name and whether to take a final backup. The deployer checks the
+  name, requires the same name as confirmation, refuses the call while that app has a build running,
+  and will not remove another app, a host mount, a hand-written edge file (`site-*.caddy` or any route file it did not write), or a path outside `$OC_ROOT`.
+  A delete for a name that is not an app is refused unless that delete was already started.
 - **Apps**: deploys with host ports, host networking or privileged mode are refused. `cap_drop: ALL`
   with five add-backs most images need (NET_BIND_SERVICE, CHOWN, SETUID, SETGID, DAC_OVERRIDE),
   `no-new-privileges`, memory/CPU/pid limits, rotated logs. Root filesystems are **writable by default**; an app opts

@@ -38,6 +38,8 @@ SeaweedFS's master, filer, and volume ports bind to loopback inside the containe
 
 `/data` on an app container is a different thing: a normal directory on disk, owned by the user in the image, included in backups. It is not a bucket. See [APP-GUIDE.md](APP-GUIDE.md).
 
+Deleting the app removes its buckets and its S3 key, then restarts object storage so the key stops working. A bucket is removed only when no other identity has `Read`, `Write`, `List`, `Tagging`, or `Admin` on that bucket. The platform admin key is bare `Admin` and does not block this. The shared `sites` bucket is not one of those buckets. Managed `/data` is removed with the app; a host folder mounted from `OC_ALLOWED_DATA_ROOTS` is not. See [DEPLOY.md](DEPLOY.md).
+
 ## Static sites
 
 Static sites are HTML, CSS, and JavaScript with no server process. You upload a single `.html` file or a `.zip` in the console (**Static sites**). The bytes are stored in a private bucket named `sites` and unpacked into `$OC_ROOT/sites/<name>/`. The edge serves the `current` release with `file_server`. The edge never calls the storage API, so a website cannot list the bucket.

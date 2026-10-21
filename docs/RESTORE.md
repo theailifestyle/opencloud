@@ -26,6 +26,8 @@ docker run --rm --network oc_control curlimages/curl -fsS --max-time 3600 \
 Raw Postgres data directories are not backed up; the dumps are. Old snapshots are pruned to
 `OC_BACKUP_KEEP_DAILY` (default 7).
 
+Deleting an app can also write a one-app folder `$OC_ROOT/backups/deleted/<name>-<time>/` (mode 0700). That folder is the final backup from **Delete app**: `app.json`, `database.sql` (`pg_dump` of that app only), `buckets/<bucket>/` (one file per object key), and `data/`. It is not inside the restic repository. Secret files are not in it. Copy it off the machine the same way if you might restore that app later. A folder ending in `-incomplete`, with an `INCOMPLETE` file inside, is a backup that did not finish. The app was not deleted. Do not treat that folder as a complete copy.
+
 The repository is `$OC_ROOT/backups/restic` and its password is `$OC_ROOT/secrets/platform/restic-password`.
 **Both are on the same disk.** Copy them elsewhere, or a dead disk takes the backups with it:
 ```bash

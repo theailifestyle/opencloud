@@ -37,4 +37,4 @@ The database container is capped at 512 MB and 0.5 CPU. There is one database pe
 
 ## Remove
 
-The console has no button that deletes a database. Take a backup before you remove anything under `$OC_ROOT/pgdata/` yourself.
+Deleting the app removes its database. On the service page, **Delete app** (see [DEPLOY.md](DEPLOY.md)) stops the database container, deletes `$OC_ROOT/pgdata/<app>/`, and deletes the credential files `$OC_ROOT/secrets/db/<app>` and `$OC_ROOT/secrets/db/<app>-runtime`. Leave **Take a final backup first** on if you want a `pg_dump` before that happens. The dump uses `-U app` only after the deployer has checked the container name, compose project, `opencloud.backup=postgres` label, image, and `POSTGRES_USER=app`. There is no separate button that drops only the database.

@@ -23,7 +23,7 @@ If an app is served only by a hand-written site, set it to **Internal**. Open Cl
 
 The console's Routes page covers most cases. When a site needs something it can't express (extra request headers, body size limits, a redirect-only host, a custom header policy), add a Caddy file by hand:
 
-1. Create `$OC_ROOT/caddy/sites/site-<name>.caddy` (root-owned, mode 644). Use the `site-` prefix. Open Cloud writes `<app>.caddy` for each app and never touches other names.
+1. Create `$OC_ROOT/caddy/sites/site-<name>.caddy` (root-owned, mode 644). Use the `site-` prefix. App names cannot start with `site-`, so a delete cannot target that file. Open Cloud writes `<app>.caddy` for each app, with `# opencloud:app=<app>` on the first line, and removes that file only when it wrote it. A hand-written file, including every `site-*.caddy`, is left in place. One that still proxies to the deleted app is named in the result.
 2. Point upstreams at `app-<app>:<port>`. Every app is reachable under that name on the edge network.
 3. `import security_headers` works in any site file. Snippets that only your files use can live in a file that sorts first, for example `00-snippets.caddy`.
 4. Check the file and apply it:
