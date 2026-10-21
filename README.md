@@ -4,15 +4,8 @@ A self-hosted console for one Linux server. It builds apps from public Git repos
 
 *Independent project; not affiliated with or endorsed by Amazon Web Services. AWS service names are used only for comparison.*
 
-<!--
-  Video teaser (placeholder). To swap in the real video, either:
-  - replace the link below with the video's URL, and
-    optionally replace docs/assets/teaser-placeholder.png with a real thumbnail; or
-  - edit this README on GitHub and drag an MP4 into the editor: GitHub uploads it and shows an
-    inline player. Then delete this block.
--->
 <p align="center">
-  <a href="https://www.youtube.com/watch?v=F0bkebAID_c"><img src="docs/assets/teaser-placeholder.png" alt="Open Cloud: watch the 2-minute tour (video coming soon)" width="720"></a>
+  <a href="https://github.com/theailifestyle/opencloud/blob/main/docs/assets/opencloud-teaser.mp4"><img src="docs/assets/teaser.png" alt="Open Cloud: 34-second teaser (click to play)" width="720"></a>
 </p>
 
 <p align="center">

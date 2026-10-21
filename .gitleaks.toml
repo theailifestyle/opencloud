@@ -6,4 +6,6 @@ title = "Open Cloud"
 paths = [
   '''(^|/)tests/''',
   '''__pycache__''',
+  # Teaser video: the founder approved publishing it as is (Oct 20, 2026). Binary, this file only.
+  '''^docs/assets/opencloud-teaser\.mp4$''',
 ]

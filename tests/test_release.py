@@ -17,13 +17,16 @@ WORDS = [t.strip() for t in os.environ.get("OC_RELEASE_DENY_WORDS", "").split(",
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
 IPV4 = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b")
 SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", ".pytest_cache"}
+# Binary video excluded from the text sweep. The founder approved publishing this teaser as is
+# (Oct 20, 2026), including the console screens it shows. Only this one file is excluded.
+SKIP_FILES = {"docs/assets/opencloud-teaser.mp4"}
 
 
 def tree_files():
     for path in ROOT.rglob("*"):
         if any(part in SKIP_DIRS for part in path.parts):
             continue
-        if path.is_file():
+        if path.is_file() and path.relative_to(ROOT).as_posix() not in SKIP_FILES:
             yield path
 
 
