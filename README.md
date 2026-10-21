@@ -6,13 +6,18 @@ A self-hosted console for one Linux server. It builds apps from public Git repos
 
 <!--
   Video teaser (placeholder). To swap in the real video, either:
-  - replace the link below (https://www.youtube.com/@theailifestyle) with the video's URL, and
+  - replace the link below with the video's URL, and
     optionally replace docs/assets/teaser-placeholder.png with a real thumbnail; or
   - edit this README on GitHub and drag an MP4 into the editor: GitHub uploads it and shows an
     inline player. Then delete this block.
 -->
 <p align="center">
-  <a href="https://www.youtube.com/@theailifestyle"><img src="docs/assets/teaser-placeholder.png" alt="Open Cloud: watch the 2-minute tour (video coming soon)" width="720"></a>
+  <a href="https://www.youtube.com/watch?v=F0bkebAID_c"><img src="docs/assets/teaser-placeholder.png" alt="Open Cloud: watch the 2-minute tour (video coming soon)" width="720"></a>
+</p>
+
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=F0bkebAID_c">Watch the full build on YouTube</a> ·
+  <a href="https://medium.com/@srechakra/i-used-ai-to-reverse-engineer-the-cloud-my-own-console-on-a-6-server-92e6a5d75e7b">Read the article</a>
 </p>
 
 ## Features
