@@ -205,9 +205,11 @@ class AgentValidation(unittest.TestCase):
             with self.assertRaises(agent.Bad):
                 agent.app_dir(bad)
         agent.app_dir("my-app")
-        for reserved in ["s3", "console", "storage"]:
+        for reserved in ["s3", "console", "storage", "llm-gateway", "site-notes", "site-static-shop"]:
             with self.assertRaises(agent.Bad):
                 agent.app_dir(reserved)
+            with self.assertRaises(agent.Bad):
+                agent.delete_app({"confirm": reserved}, reserved)
 
     def test_bucket_names(self):
         self.assertTrue(agent.BUCKET.match("my-bucket"))
@@ -1314,6 +1316,625 @@ class DnsChain(unittest.TestCase):
         self.assertIn('<option value="site:cc">', html)
         self.assertIn('action="/sites/cc/real-cert"', html)
         self.assertIn("Redirect www to the main domain", html)
+
+
+class FilerFake:
+    """The filer HTTP shape SeaweedFS 4.48 returns. `weed filer.copy` is not a download."""
+
+    def __init__(self, extra=()):
+        self.dirs = {"/buckets/my-app-files", "/buckets/my-app-files/dir"}
+        self.files = {
+            "/buckets/my-app-files/hello.txt": b"hello-bytes",
+            "/buckets/my-app-files/bin.dat": bytes(range(256)) + b"\x00hi",
+            "/buckets/my-app-files/dir/nested.txt": b"nested-bytes",
+            "/buckets/my-app-files/dir/empty": b"",
+            "/buckets/my-app-files/dir/a b.txt": b"space name",
+            "/buckets/my-app-files/dir/.hidden": b"dot",
+        }
+        self.extra = list(extra)
+        self.calls = []
+
+    def run(self, argv, timeout=600):
+        from urllib.parse import parse_qs, unquote, urlparse
+        self.calls.append(list(argv))
+        if not argv or argv[0] != "wget" or "filer.copy" in argv:
+            return type("R", (), {"returncode": 1, "stdout": b"", "stderr": b"unexpected command"})()
+        url = urlparse(argv[-1])
+        path = unquote(url.path).rstrip("/")
+        if "Accept: application/json" in argv:
+            if path not in self.dirs:
+                return type("R", (), {"returncode": 8, "stdout": b"", "stderr": b"404 Not Found"})()
+            query = parse_qs(url.query)
+            limit = int(query.get("limit", ["1000"])[0])
+            last = query.get("lastFileName", [""])[0]
+            prefix = path + "/"
+            children = [p for p in sorted(self.dirs | set(self.files))
+                        if p.startswith(prefix) and "/" not in p[len(prefix):]]
+            children.sort(key=lambda p: p.rsplit("/", 1)[-1])
+            if last:
+                children = [p for p in children if p.rsplit("/", 1)[-1] > last]
+            if path == "/buckets/my-app-files" and not last:
+                children = children + self.extra
+            page = children[:limit]
+            entries = []
+            for p in page:
+                if p in self.extra:
+                    entries.append({"FullPath": p, "Mode": 432, "FileSize": len(self.files.get(p, b""))})
+                    continue
+                if p in self.dirs:
+                    entries.append({"FullPath": p, "Mode": (1 << 31) | 0o755, "FileSize": 0, "SymlinkTarget": ""})
+                else:
+                    body = self.files[p]
+                    entries.append({"FullPath": p, "Mode": 432, "FileSize": len(body), "SymlinkTarget": ""})
+            payload = {"Entries": entries, "ShouldDisplayLoadMore": len(children) > limit,
+                       "LastFileName": page[-1].rsplit("/", 1)[-1] if page else last}
+            return type("R", (), {"returncode": 0, "stdout": json.dumps(payload).encode(), "stderr": b""})()
+        if path not in self.files:
+            return type("R", (), {"returncode": 8, "stdout": b"", "stderr": b"404 Not Found"})()
+        return type("R", (), {"returncode": 0, "stdout": self.files[path], "stderr": b""})()
+
+
+class DeleteApp(unittest.TestCase):
+    """Deleting one app stays inside that app. A second run finishes whatever the first run left."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = Path(tempfile.mkdtemp())
+        self._root, self._run, self._export, self._mode = agent.ROOT, agent.run, agent.export_bucket, agent.EDGE_MODE
+        agent.ROOT = self.tmp / "oc"
+        self.outside = self.tmp / "outside"
+        self.outside.mkdir()
+        (self.outside / "keep.txt").write_text("keep-this")
+        os.chmod(self.outside / "keep.txt", 0o644)
+        for kind in ("apps", "data", "pgdata", "releases", "caddy/sites", "secrets/apps", "secrets/db",
+                     "secrets/storage", "secrets/gateway-clients", "secrets/platform", "jobs", "audit", "gateway", "backups"):
+            (agent.ROOT / kind).mkdir(parents=True, exist_ok=True)
+        self.app = {
+            "name": "my-app", "repo": "https://example.com/org/my-app.git", "port": 8080, "db": True,
+            "image_tag": "tag1", "commit": "abc", "visibility": "external",
+            "data_mounts": [{"source": str(self.outside), "target": "/notes"}],
+            "secret_mounts": [{"source": str(self.outside / "keep.txt"), "target": "NOTES"}],
+        }
+        self.write_app("my-app", self.app)
+        self.write_app("other-app", {"name": "other-app", "repo": "https://example.com/org/other.git", "port": 8080, "db": True, "image_tag": "tag2"})
+        (agent.ROOT / "apps" / "my-app" / "compose.yaml").write_text("{}\n")
+        (agent.ROOT / "apps" / "other-app" / "compose.yaml").write_text("{}\n")
+        (agent.ROOT / "data" / "my-app" / "file.txt").parent.mkdir(parents=True)
+        (agent.ROOT / "data" / "my-app" / "file.txt").write_text("data-bytes")
+        link = agent.ROOT / "data" / "my-app" / "escape"
+        link.symlink_to(self.outside / "keep.txt")
+        (agent.ROOT / "data" / "other-app").mkdir()
+        (agent.ROOT / "data" / "other-app" / "file.txt").write_text("other-data")
+        (agent.ROOT / "pgdata" / "my-app").mkdir()
+        (agent.ROOT / "pgdata" / "my-app" / "PG_VERSION").write_text("17")
+        (agent.ROOT / "pgdata" / "other-app").mkdir()
+        (agent.ROOT / "secrets" / "apps" / "my-app").mkdir(parents=True)
+        (agent.ROOT / "secrets" / "apps" / "other-app").mkdir(parents=True)
+        (agent.ROOT / "secrets" / "apps" / "my-app" / "DATABASE_URL").write_text("postgresql://app_runtime:SUPERSECRETVALUE@db:5432/app")
+        (agent.ROOT / "secrets" / "apps" / "other-app" / "DATABASE_URL").write_text("postgresql://app_runtime:OTHERSECRETVALUE@db:5432/app")
+        (agent.ROOT / "secrets" / "db" / "my-app").write_text("owner-secret")
+        (agent.ROOT / "secrets" / "db" / "my-app-runtime").write_text("runtime-secret")
+        (agent.ROOT / "secrets" / "db" / "other-app").write_text("other-owner-secret")
+        (agent.ROOT / "secrets" / "platform" / "llm-upstream-key").write_text("provider-key-value")
+        (agent.ROOT / "secrets" / "gateway-clients" / "my-app").write_text("gateway-client-secret")
+        (agent.ROOT / "secrets" / "gateway-clients" / "other-app").write_text("other-gateway-secret")
+        (agent.ROOT / "caddy" / "sites" / "my-app.caddy").write_text(
+            "# opencloud:app=my-app\nmy-app.example.com {\n\treverse_proxy app-my-app:8080\n}\n")
+        (agent.ROOT / "caddy" / "sites" / "other-app.caddy").write_text("other-app.example.com {\n\treverse_proxy app-other-app:8080\n}\n")
+        (agent.ROOT / "caddy" / "sites" / "site-notes.caddy").write_text("notes.example.com {\n\treverse_proxy app-my-app:8080\n}\n")
+        (agent.ROOT / "releases" / "my-app").mkdir()
+        (agent.ROOT / "releases" / "my-app" / "1.json").write_text(json.dumps({"time": "t", "action": "deploy", "image_tag": "tag1", "commit": "abc", "repo": "https://example.com/org/my-app.git"}))
+        (agent.ROOT / "releases" / "other-app").mkdir()
+        (agent.ROOT / "releases" / "other-app" / "1.json").write_text(json.dumps({"time": "t", "action": "deploy", "image_tag": "tag2"}))
+        (agent.ROOT / "jobs" / "aaa.json").write_text(json.dumps({"id": "aaa", "kind": "deploy", "app": "my-app", "status": "succeeded"}))
+        (agent.ROOT / "jobs" / "bbb.json").write_text(json.dumps({"id": "bbb", "kind": "deploy", "app": "other-app", "status": "succeeded"}))
+        (agent.ROOT / "gateway" / "config.json").write_text(json.dumps({"upstream_url": "", "endpoints": {"chat-fast": {"model": "m", "rpm": 60, "apps": ["my-app", "other-app"]}}}))
+        s3 = {"identities": [
+            {"name": "opencloud-admin", "credentials": [{"accessKey": "OCADMIN", "secretKey": "admin-secret-value"}], "actions": ["Admin"]},
+            {"name": "app-my-app", "credentials": [{"accessKey": "OCAPP", "secretKey": "app-secret-value"}],
+             "actions": ["Read:my-app-files", "Write:my-app-files", "List:my-app-files", "Tagging:my-app-files", "Read:sites"]},
+            {"name": "app-other-app", "credentials": [{"accessKey": "OCOTHER", "secretKey": "other-secret-value"}],
+             "actions": ["Read:other-files", "Write:other-files"]},
+        ]}
+        (agent.ROOT / "secrets" / "storage" / "s3.json").write_text(json.dumps(s3))
+        self.docker, self.inputs, self.exported, self.fail_images = [], [], [], False
+        self.db_inspect, self.db_missing = None, False
+        agent.run = self.fake_run
+        agent.export_bucket = self.fake_export
+        agent.EDGE_MODE = "internal"
+        agent.BUSY.clear()
+
+    def tearDown(self):
+        agent.ROOT, agent.run, agent.export_bucket, agent.EDGE_MODE = self._root, self._run, self._export, self._mode
+        agent.BUSY.clear()
+
+    def write_app(self, name, app):
+        d = agent.ROOT / "apps" / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "app.json").write_text(json.dumps(app))
+
+    def fake_export(self, bucket, dest):
+        self.exported.append(bucket)
+        d = Path(dest) / bucket
+        d.mkdir(parents=True)
+        (d / "hello.txt").write_text("bucket-object")
+        return "ok"
+
+    def fake_run(self, args, timeout=900, check=True, **kw):
+        self.docker.append(list(args))
+        self.inputs.append(kw.get("input"))
+        if args[:3] == ["docker", "image", "rm"] and self.fail_images:
+            self.fail_images = False
+            raise agent.Bad("image rm failed")
+        if args[:2] == ["docker", "inspect"]:
+            fmt = args[args.index("-f") + 1]
+            if "opencloud.backup" in fmt:
+                if self.db_missing or args[-1] != "oc-app-my-app-db-1":
+                    return self.done("", "no such container", 1)
+                return self.done(self.db_inspect or (
+                    "/oc-app-my-app-db-1\trunning\toc-app-my-app\tpostgres\tpostgres:17-alpine\n"
+                    "POSTGRES_USER=app\nPOSTGRES_DB=app\n"))
+            return self.done("healthy\n" if "Health" in fmt else "running\n")
+        if args[:3] == ["docker", "image", "ls"]:
+            return self.done("oc-app-my-app\ttag1\tabc\noc-app-other-app\ttag2\tdef\npostgres\t17\tfff\n")
+        if "pg_dump" in args:
+            if args[2] != "oc-app-my-app-db-1":
+                raise agent.Bad("refusing to dump " + args[2])
+            return self.done("DUMP-my-app\n")
+        if args[:2] == ["docker", "ps"]:
+            return self.done("")
+        if args[1:3] == ["network", "rm"]:
+            return self.done("", "", 0 if args[-1] == "oc-app-my-app_db" else 1)
+        return self.done()
+
+    @staticmethod
+    def done(out="", err="", code=0):
+        return type("R", (), {"returncode": code, "stdout": out, "stderr": err})()
+
+    def texts(self, root):
+        out = []
+        if not root.exists():
+            return out
+        for p in root.rglob("*"):
+            if p.is_file() and not p.is_symlink():
+                out.append(p.read_text(errors="replace"))
+        return out
+
+    def test_validation_and_confirm(self):
+        for bad in ("../other-app", "my-app/../../etc", "Other", "", "console"):
+            with self.assertRaises(agent.Bad):
+                agent.delete_app({"confirm": bad}, bad)
+        with self.assertRaises(agent.Bad):
+            agent.delete_app({"confirm": "other-app"}, "my-app")
+        self.assertTrue((agent.ROOT / "apps" / "my-app" / "app.json").exists())
+        self.assertTrue((agent.ROOT / "apps" / "other-app" / "app.json").exists())
+        self.assertFalse(agent.watch_allowed("POST", "/apps/my-app/delete"))
+
+    def test_busy_refuses_and_touches_nothing(self):
+        agent.BUSY.add("my-app")
+        with self.assertRaisesRegex(agent.Bad, "already running"):
+            agent.delete_app({"confirm": "my-app"}, "my-app")
+        self.assertIn("my-app", agent.BUSY)
+        self.assertTrue((agent.ROOT / "apps" / "my-app" / "app.json").exists())
+        self.assertEqual(self.docker, [])
+
+    def test_backup_on_is_scoped_and_idempotent(self):
+        res = agent.delete_app({"confirm": "my-app"}, "my-app")
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["backup_path"])
+        backup = Path(res["backup_path"])
+        self.assertEqual(backup.stat().st_mode & 0o777, 0o700)
+        self.assertFalse((backup / "INCOMPLETE").exists())
+        self.assertFalse(backup.name.endswith("-incomplete"))
+        self.assertEqual((backup / "database.sql").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((backup / "database.sql").read_text(), "DUMP-my-app\n")
+        saved = json.loads((backup / "app.json").read_text())
+        self.assertEqual(saved["repo"], "https://example.com/org/my-app.git")
+        self.assertEqual((backup / "buckets" / "my-app-files" / "hello.txt").read_text(), "bucket-object")
+        self.assertEqual((backup / "data" / "file.txt").read_text(), "data-bytes")
+        self.assertTrue((backup / "data" / "escape").is_symlink())
+        self.assertEqual(self.outside.joinpath("keep.txt").stat().st_mode & 0o777, 0o644)
+        blob = "\n".join(self.texts(backup))
+        for secret in ("SUPERSECRETVALUE", "OTHERSECRETVALUE", "app-secret-value", "admin-secret-value", "provider-key-value", "gateway-client-secret"):
+            self.assertNotIn(secret, blob)
+        self.assertEqual(self.exported, ["my-app-files"])
+        self.assertFalse((agent.ROOT / "apps" / "my-app").exists())
+        self.assertFalse((agent.ROOT / "data" / "my-app").exists())
+        self.assertFalse((agent.ROOT / "pgdata" / "my-app").exists())
+        self.assertFalse((agent.ROOT / "secrets" / "apps" / "my-app").exists())
+        self.assertFalse((agent.ROOT / "secrets" / "db" / "my-app").exists())
+        self.assertFalse((agent.ROOT / "secrets" / "db" / "my-app-runtime").exists())
+        self.assertFalse((agent.ROOT / "secrets" / "gateway-clients" / "my-app").exists())
+        self.assertFalse((agent.ROOT / "caddy" / "sites" / "my-app.caddy").exists())
+        self.assertTrue((agent.ROOT / "apps" / "other-app" / "app.json").exists())
+        self.assertEqual((agent.ROOT / "data" / "other-app" / "file.txt").read_text(), "other-data")
+        self.assertTrue((agent.ROOT / "pgdata" / "other-app").exists())
+        self.assertEqual((agent.ROOT / "secrets" / "db" / "other-app").read_text(), "other-owner-secret")
+        self.assertEqual((agent.ROOT / "secrets" / "apps" / "other-app" / "DATABASE_URL").read_text(), "postgresql://app_runtime:OTHERSECRETVALUE@db:5432/app")
+        self.assertEqual((agent.ROOT / "caddy" / "sites" / "other-app.caddy").read_text().split()[0], "other-app.example.com")
+        self.assertIn("app-my-app:8080", (agent.ROOT / "caddy" / "sites" / "site-notes.caddy").read_text())
+        self.assertEqual((self.outside / "keep.txt").read_text(), "keep-this")
+        self.assertEqual((agent.ROOT / "secrets" / "platform" / "llm-upstream-key").read_text(), "provider-key-value")
+        self.assertEqual((agent.ROOT / "secrets" / "gateway-clients" / "other-app").read_text(), "other-gateway-secret")
+        cfg = json.loads((agent.ROOT / "secrets" / "storage" / "s3.json").read_text())
+        names = [i["name"] for i in cfg["identities"]]
+        self.assertEqual(names, ["opencloud-admin", "app-other-app"])
+        self.assertIn("admin-secret-value", (agent.ROOT / "secrets" / "storage" / "s3.json").read_text())
+        self.assertEqual(agent.gw_config()["endpoints"]["chat-fast"]["apps"], ["other-app"])
+        self.assertTrue(any(c[:4] == ["docker", "compose", "-f", str(agent.ROOT / "apps" / "my-app" / "compose.yaml")] and "oc-app-my-app" in c for c in self.docker))
+        self.assertFalse(any("other-app/compose.yaml" in " ".join(c) or "oc-app-other-app" in c for c in self.docker))
+        removed = [c[-1] for c in self.docker if c[:3] == ["docker", "image", "rm"]]
+        self.assertEqual(removed, ["oc-app-my-app:tag1"])
+        scripts = "\n".join(i or "" for i in self.inputs)
+        self.assertIn("s3.bucket.delete -name my-app-files", scripts)
+        self.assertNotIn("/buckets/sites", scripts)
+        self.assertNotIn("other-files", scripts)
+        self.assertNotIn("oc-app-other-app_db", "\n".join(" ".join(c) for c in self.docker))
+        self.assertFalse((agent.ROOT / "secrets" / "storage" / "restart-required").exists())
+        self.assertTrue(any(c[:2] == ["docker", "restart"] and c[-1] == "oc-storage" for c in self.docker))
+        marker = json.loads((agent.ROOT / "releases" / "my-app" / "DELETED").read_text())
+        self.assertTrue(marker["deleted"])
+        self.assertEqual(marker["backup"], res["backup_path"])
+        self.assertTrue((agent.ROOT / "releases" / "my-app" / "1.json").exists())
+        actions = [json.loads(p.read_text())["action"] for p in (agent.ROOT / "releases" / "my-app").glob("*.json")]
+        self.assertIn("delete", actions)
+        self.assertTrue(json.loads((agent.ROOT / "jobs" / "aaa.json").read_text())["app_deleted"])
+        self.assertNotIn("app_deleted", json.loads((agent.ROOT / "jobs" / "bbb.json").read_text()))
+        self.assertEqual((agent.ROOT / "releases" / "other-app" / "1.json").read_text()[:1], "{")
+        audit = (agent.ROOT / "audit" / "audit.log").read_text()
+        self.assertIn("app-delete", audit)
+        self.assertNotIn("SUPERSECRETVALUE", audit)
+        self.assertNotIn("app-secret-value", audit)
+        kept = {s["step"]: s for s in res["steps"] if s["status"] == "kept"}
+        self.assertIn(str(self.outside), kept["data_mount"]["detail"])
+        self.assertEqual(kept["hand_route"]["detail"], "site-notes.caddy")
+        again = agent.delete_app({"confirm": "my-app", "backup": True}, "my-app")
+        self.assertTrue(again["ok"])
+        self.assertIsNone(again["backup_path"])
+        self.assertIn("already marked deleted", " ".join(s["detail"] for s in again["steps"]))
+        self.assertTrue((agent.ROOT / "apps" / "other-app" / "app.json").exists())
+
+    def test_backup_off_skips_the_folder(self):
+        res = agent.delete_app({"confirm": "my-app", "backup": False}, "my-app")
+        self.assertIsNone(res["backup_path"])
+        self.assertFalse((agent.ROOT / "backups" / "deleted").exists())
+        self.assertFalse((agent.ROOT / "apps" / "my-app").exists())
+        self.assertEqual(self.exported, [])
+        self.assertFalse(any("pg_dump" in c for c in self.docker))
+        self.assertEqual([s for s in res["steps"] if s["step"] == "backup"], [{"step": "backup", "status": "skipped", "detail": "backup off"}])
+
+    def test_failed_dump_deletes_nothing(self):
+        def no_db(args, timeout=900, check=True, **kw):
+            self.docker.append(list(args))
+            if "pg_dump" in args:
+                raise agent.Bad("pg_dump failed")
+            if args[:2] == ["docker", "inspect"]:
+                fmt = args[args.index("-f") + 1]
+                if "opencloud.backup" in fmt:
+                    return self.done("/oc-app-my-app-db-1\trunning\toc-app-my-app\tpostgres\tpostgres:17-alpine\nPOSTGRES_USER=app\n")
+                return self.done("running\n")
+            return self.done()
+        agent.run = no_db
+        with self.assertRaisesRegex(agent.Bad, "was not deleted"):
+            agent.delete_app({"confirm": "my-app"}, "my-app")
+        self.assertTrue((agent.ROOT / "apps" / "my-app" / "app.json").exists())
+        self.assertTrue((agent.ROOT / "pgdata" / "my-app" / "PG_VERSION").exists())
+        self.assertTrue((agent.ROOT / "caddy" / "sites" / "my-app.caddy").exists())
+        self.assertFalse(any(c[:2] == ["docker", "compose"] for c in self.docker))
+        partial = list((agent.ROOT / "backups" / "deleted").glob("my-app-*-incomplete"))
+        self.assertEqual(len(partial), 1)
+        self.assertIn("did not finish", (partial[0] / "INCOMPLETE").read_text())
+        self.assertTrue((partial[0] / "app.json").is_file())
+        self.assertFalse(any(not p.name.endswith("-incomplete") for p in (agent.ROOT / "backups" / "deleted").iterdir()))
+
+    def test_backup_downloads_every_bucket_object(self):
+        agent.export_bucket = self._export
+        filer = FilerFake()
+        agent.storage_run = filer.run
+        agent.FILER_LIST_LIMIT = 1
+        try:
+            res = agent.delete_app({"confirm": "my-app"}, "my-app")
+        finally:
+            agent.FILER_LIST_LIMIT = 1000
+        self.assertTrue(res["ok"])
+        backup = Path(res["backup_path"])
+        base = backup / "buckets" / "my-app-files"
+        self.assertEqual((base / "hello.txt").read_bytes(), b"hello-bytes")
+        self.assertEqual((base / "bin.dat").read_bytes(), bytes(range(256)) + b"\x00hi")
+        self.assertEqual((base / "dir" / "nested.txt").read_bytes(), b"nested-bytes")
+        self.assertEqual((base / "dir" / "empty").read_bytes(), b"")
+        self.assertEqual((base / "dir" / "a b.txt").read_bytes(), b"space name")
+        self.assertEqual((base / "dir" / ".hidden").read_bytes(), b"dot")
+        self.assertFalse((backup / "INCOMPLETE").exists())
+        self.assertFalse(any("filer.copy" in c for c in filer.calls))
+        listed = [c for c in filer.calls if "Accept: application/json" in c]
+        self.assertTrue(any("lastFileName=" in c[-1] for c in listed))
+        self.assertTrue(all(c[0] == "wget" and c[-1].startswith("http://127.0.0.1:8888/buckets/my-app-files") for c in filer.calls))
+        self.assertFalse((agent.ROOT / "apps" / "my-app").exists())
+        self.assertTrue((agent.ROOT / "apps" / "other-app" / "app.json").exists())
+
+    def test_unsafe_object_key_does_not_escape_and_marks_the_backup(self):
+        agent.export_bucket = self._export
+        outside = self.tmp / "pwned"
+        filer = FilerFake(extra=["/buckets/my-app-files/../../" + outside.name])
+        agent.storage_run = filer.run
+        with self.assertRaisesRegex(agent.Bad, "was not deleted"):
+            agent.delete_app({"confirm": "my-app"}, "my-app")
+        self.assertFalse(outside.exists())
+        self.assertFalse((self.tmp / "pwned").exists())
+        self.assertTrue((agent.ROOT / "apps" / "my-app" / "app.json").exists())
+        partial = list((agent.ROOT / "backups" / "deleted").glob("my-app-*-incomplete"))
+        self.assertEqual(len(partial), 1)
+        self.assertTrue((partial[0] / "INCOMPLETE").is_file())
+        self.assertFalse(any("filer.copy" in c for c in filer.calls))
+
+    def test_partial_failure_is_safe_to_rerun(self):
+        self.fail_images = True
+        with self.assertRaisesRegex(agent.Bad, "image rm failed"):
+            agent.delete_app({"confirm": "my-app"}, "my-app")
+        self.assertFalse((agent.ROOT / "caddy" / "sites" / "my-app.caddy").exists())
+        self.assertTrue((agent.ROOT / "apps" / "my-app" / "app.json").exists())
+        self.assertTrue((agent.ROOT / "pgdata" / "my-app").exists())
+        res = agent.delete_app({"confirm": "my-app"}, "my-app")
+        self.assertTrue(res["ok"])
+        self.assertFalse((agent.ROOT / "apps" / "my-app").exists())
+        self.assertTrue((agent.ROOT / "apps" / "other-app" / "app.json").exists())
+        self.assertIn("route=absent", " ".join(f"{s['step']}={s['status']}" for s in res["steps"]))
+
+    def test_shared_bucket_is_refused(self):
+        cfg = json.loads((agent.ROOT / "secrets" / "storage" / "s3.json").read_text())
+        cfg["identities"][2]["actions"].append("Read:my-app-files")
+        (agent.ROOT / "secrets" / "storage" / "s3.json").write_text(json.dumps(cfg))
+        with self.assertRaisesRegex(agent.Bad, "another identity"):
+            agent.delete_app({"confirm": "my-app"}, "my-app")
+        self.assertTrue((agent.ROOT / "apps" / "my-app" / "app.json").exists())
+        names = [i["name"] for i in json.loads((agent.ROOT / "secrets" / "storage" / "s3.json").read_text())["identities"]]
+        self.assertIn("app-my-app", names)
+
+    def test_symlink_escape_is_not_followed(self):
+        target = self.outside / "pg"
+        target.mkdir()
+        (target / "PG_VERSION").write_text("17")
+        pg = agent.ROOT / "pgdata" / "my-app"
+        import shutil as sh
+        sh.rmtree(pg)
+        pg.symlink_to(target)
+        res = agent.delete_app({"confirm": "my-app", "backup": False}, "my-app")
+        self.assertFalse(pg.exists())
+        self.assertEqual((target / "PG_VERSION").read_text(), "17")
+        self.assertTrue(any("left in place" in s["detail"] for s in res["steps"]))
+
+    def test_runtime_file_shared_with_another_app_is_kept(self):
+        self.write_app("my-app-runtime", {"name": "my-app-runtime", "repo": "https://example.com/org/rt.git", "port": 8080})
+        res = agent.delete_app({"confirm": "my-app", "backup": False}, "my-app")
+        self.assertTrue(res["ok"])
+        self.assertEqual((agent.ROOT / "secrets" / "db" / "my-app-runtime").read_text(), "runtime-secret")
+        self.assertFalse((agent.ROOT / "secrets" / "db" / "my-app").exists())
+        self.assertTrue((agent.ROOT / "apps" / "my-app-runtime" / "app.json").exists())
+
+    def test_unexpected_container_is_refused(self):
+        (agent.ROOT / "apps" / "my-app" / "compose.yaml").unlink()
+        def listed(args, timeout=900, check=True, **kw):
+            self.docker.append(list(args))
+            if args[:2] == ["docker", "ps"]:
+                return self.done("oc-app-my-app-web-1\nevil\n")
+            return self.done()
+        agent.run = listed
+        with self.assertRaisesRegex(agent.Bad, "unexpected container"):
+            agent.compose_down("my-app")
+        self.assertFalse(any(c[:2] == ["docker", "rm"] for c in self.docker))
+
+    def test_bucket_archive_rejects_escape(self):
+        import io, tarfile
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            raw = b"hello"
+            info = tarfile.TarInfo("my-app-files/hello.txt")
+            info.size = len(raw)
+            tar.addfile(info, io.BytesIO(raw))
+            link = tarfile.TarInfo("my-app-files/link")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "../keep.txt"
+            tar.addfile(link)
+        dest = self.tmp / "out"
+        with self.assertRaises(agent.Bad):
+            agent.safe_extract_tar(buf.getvalue(), "my-app-files", dest)
+        self.assertFalse((dest / "keep.txt").exists())
+        with self.assertRaises(agent.Bad):
+            agent.bucket_shell("sites", "")
+        with self.assertRaises(agent.Bad):
+            agent.bucket_shell("../x", "")
+
+    def test_site_prefix_and_foreign_edge_files(self):
+        notes = agent.ROOT / "caddy" / "sites" / "site-notes.caddy"
+        marked = "# opencloud:app=site-notes\nnotes.example.com {\n\treverse_proxy app-site-notes:80\n}\n"
+        notes.write_text(marked)
+        status, detail = agent.remove_route("site-notes")
+        self.assertEqual((status, detail), ("kept", "site-notes.caddy"))
+        self.assertEqual(notes.read_text(), marked)
+        self.assertFalse(any("reload" in c for c in self.docker))
+        with self.assertRaises(agent.Bad):
+            agent.delete_app({"confirm": "site-notes"}, "site-notes")
+        self.assertEqual(notes.read_text(), marked)
+        self.assertFalse((agent.ROOT / "releases" / "site-notes").exists())
+        self.assertTrue((agent.ROOT / "apps" / "my-app" / "app.json").exists())
+
+    def test_missing_app_is_refused(self):
+        rogue = agent.ROOT / "caddy" / "sites" / "missing-app.caddy"
+        rogue.write_text("not a managed route\n")
+        notes = (agent.ROOT / "caddy" / "sites" / "site-notes.caddy").read_text()
+        with self.assertRaisesRegex(agent.Bad, "no such app"):
+            agent.delete_app({"confirm": "missing-app"}, "missing-app")
+        self.assertEqual(rogue.read_text(), "not a managed route\n")
+        self.assertEqual((agent.ROOT / "caddy" / "sites" / "site-notes.caddy").read_text(), notes)
+        self.assertFalse((agent.ROOT / "releases" / "missing-app").exists())
+        self.assertEqual(self.docker, [])
+        self.assertFalse((agent.ROOT / "audit" / "audit.log").exists())
+        self.assertEqual(agent.remove_route("missing-app"), ("kept", "missing-app.caddy"))
+        self.assertEqual(rogue.read_text(), "not a managed route\n")
+
+    def test_releases_alone_are_not_an_app(self):
+        import shutil
+        shutil.rmtree(agent.ROOT / "apps" / "my-app")
+        with self.assertRaisesRegex(agent.Bad, "no such app"):
+            agent.delete_app({"confirm": "my-app"}, "my-app")
+        self.assertTrue((agent.ROOT / "pgdata" / "my-app" / "PG_VERSION").exists())
+        self.assertTrue((agent.ROOT / "caddy" / "sites" / "my-app.caddy").exists())
+        self.assertFalse((agent.ROOT / "releases" / "my-app" / "DELETING").exists())
+
+    def test_recorded_delete_can_resume_without_the_app_folder(self):
+        import shutil
+        shutil.rmtree(agent.ROOT / "apps" / "my-app")
+        (agent.ROOT / "releases" / "my-app" / "DELETING").write_text('{"deleting": true, "app": "my-app"}\n')
+        res = agent.delete_app({"confirm": "my-app", "backup": False}, "my-app")
+        self.assertTrue(res["ok"])
+        self.assertFalse((agent.ROOT / "caddy" / "sites" / "my-app.caddy").exists())
+        self.assertFalse((agent.ROOT / "pgdata" / "my-app").exists())
+        self.assertFalse((agent.ROOT / "releases" / "my-app" / "DELETING").exists())
+        self.assertTrue((agent.ROOT / "releases" / "my-app" / "DELETED").is_file())
+        self.assertTrue((agent.ROOT / "apps" / "other-app" / "app.json").exists())
+        self.assertIn("app-my-app:8080", (agent.ROOT / "caddy" / "sites" / "site-notes.caddy").read_text())
+
+    def test_foreign_route_file_and_symlink_are_left(self):
+        foreign = "hand-written, leave this\n"
+        site = agent.ROOT / "caddy" / "sites" / "my-app.caddy"
+        site.write_text(foreign)
+        res = agent.delete_app({"confirm": "my-app", "backup": False}, "my-app")
+        self.assertEqual(site.read_text(), foreign)
+        self.assertEqual(next(s for s in res["steps"] if s["step"] == "route")["status"], "kept")
+        self.assertFalse(any("reload" in c for c in self.docker))
+        self.assertEqual((agent.ROOT / "caddy" / "sites" / "other-app.caddy").read_text().split()[0], "other-app.example.com")
+        self.write_app("my-app", self.app)
+        target = self.outside / "edge.caddy"
+        target.write_text("keep-edge\n")
+        site.unlink()
+        site.symlink_to(target)
+        res = agent.delete_app({"confirm": "my-app", "backup": False}, "my-app")
+        self.assertTrue(site.is_symlink())
+        self.assertEqual(target.read_text(), "keep-edge\n")
+        self.assertEqual(next(s for s in res["steps"] if s["step"] == "route")["status"], "kept")
+
+    def test_legacy_generated_route_is_removed_and_a_wrong_marker_is_not(self):
+        body = agent.render_site_body(self.app)
+        self.assertFalse(body.startswith("#"))
+        site = agent.ROOT / "caddy" / "sites" / "my-app.caddy"
+        site.write_text(body)
+        res = agent.delete_app({"confirm": "my-app", "backup": False}, "my-app")
+        self.assertFalse(site.exists())
+        self.assertEqual(next(s for s in res["steps"] if s["step"] == "route")["status"], "removed")
+        self.assertTrue(any("reload" in c for c in self.docker))
+        self.write_app("my-app", self.app)
+        wrong = "# opencloud:app=other-app\nmy-app.example.com {\n}\n"
+        site.write_text(wrong)
+        self.docker.clear()
+        res = agent.delete_app({"confirm": "my-app", "backup": False}, "my-app")
+        self.assertEqual(site.read_text(), wrong)
+        self.assertEqual(next(s for s in res["steps"] if s["step"] == "route")["status"], "kept")
+        self.assertFalse(any("reload" in c for c in self.docker))
+
+    def test_internal_route_leaves_a_foreign_file(self):
+        text = "leave-me\n"
+        site = agent.ROOT / "caddy" / "sites" / "my-app.caddy"
+        site.write_text(text)
+        agent.route({**self.app, "visibility": "internal"})
+        self.assertEqual(site.read_text(), text)
+        self.assertFalse(any("reload" in c for c in self.docker))
+        site.write_text("# opencloud:app=my-app\n" + text)
+        agent.route({**self.app, "visibility": "internal"})
+        self.assertFalse(site.exists())
+        self.assertTrue(any("reload" in c for c in self.docker))
+
+    def test_dump_refuses_a_container_that_is_not_this_database(self):
+        specs = (
+            "/oc-app-my-app-db-1\trunning\toc-app-my-app\tpostgres\tpostgres:17-alpine\nPOSTGRES_USER=other\n",
+            "/oc-app-my-app-db-1\trunning\tother\tpostgres\tpostgres:17-alpine\nPOSTGRES_USER=app\n",
+            "/oc-app-my-app-db-1\trunning\toc-app-my-app\tnope\tpostgres:17-alpine\nPOSTGRES_USER=app\n",
+            "/evil\trunning\toc-app-my-app\tpostgres\tpostgres:17-alpine\nPOSTGRES_USER=app\n",
+            "/oc-app-my-app-db-1\trunning\toc-app-my-app\tpostgres\tredis:7\nPOSTGRES_USER=app\n",
+            "/oc-app-my-app-db-1\trunning\toc-app-my-app\tpostgres\tpostgres:17-alpine\nPOSTGRES_USER=application\n",
+        )
+        for spec in specs:
+            self.docker.clear()
+            self.db_inspect = spec
+            with self.assertRaisesRegex(agent.Bad, "refusing database container"):
+                agent.database_dump("my-app")
+            self.assertFalse(any("pg_dump" in c or (len(c) > 1 and c[1] == "start") for c in self.docker))
+        self.db_missing = True
+        self.assertIsNone(agent.database_dump("my-app"))
+        self.db_missing = False
+        self.db_inspect = ("/oc-app-my-app-db-1\texited\toc-app-my-app\tpostgres\t"
+                           "docker.io/library/postgres:17-alpine\nPOSTGRES_USER=app\n")
+        self.assertEqual(agent.database_dump("my-app"), "DUMP-my-app\n")
+        self.assertTrue(any(c[:3] == ["docker", "start", "oc-app-my-app-db-1"] for c in self.docker))
+        dumped = next(c for c in self.docker if "pg_dump" in c)
+        self.assertEqual(dumped[dumped.index("pg_dump") + 1:dumped.index("pg_dump") + 5], ["-U", "app", "--no-password", "-d"])
+
+    def test_bucket_ownership_is_exact(self):
+        cfg = json.loads((agent.ROOT / "secrets" / "storage" / "s3.json").read_text())
+        cfg["identities"][2]["actions"].append("Write:my-app-files")
+        (agent.ROOT / "secrets" / "storage" / "s3.json").write_text(json.dumps(cfg))
+        with self.assertRaisesRegex(agent.Bad, "another identity"):
+            agent.delete_app({"confirm": "my-app", "backup": False}, "my-app")
+        self.assertTrue((agent.ROOT / "apps" / "my-app" / "app.json").exists())
+        self.assertFalse(any("my-app-files" in (i or "") for i in self.inputs))
+        cfg["identities"][2]["actions"].remove("Write:my-app-files")
+        cfg["identities"][0]["actions"] = ["Admin", "Admin:sites", "Read:*", "Write:not a bucket"]
+        cfg["identities"][1]["actions"] = ["Write:my-app-files", "List:my-app-files", "Tagging:my-app-files",
+                                            "Read:NOPE", "Admin", "List:sites", "Read:sites"]
+        (agent.ROOT / "secrets" / "storage" / "s3.json").write_text(json.dumps(cfg))
+        res = agent.delete_app({"confirm": "my-app", "backup": False}, "my-app")
+        self.assertTrue(res["ok"])
+        scripts = "\n".join(i or "" for i in self.inputs)
+        self.assertIn("s3.bucket.delete -name my-app-files", scripts)
+        for leaked in ("/buckets/sites", "NOPE", "not a bucket", "other-files", "Read:"):
+            self.assertNotIn(leaked, scripts)
+        names = [i["name"] for i in json.loads((agent.ROOT / "secrets" / "storage" / "s3.json").read_text())["identities"]]
+        self.assertEqual(names, ["opencloud-admin", "app-other-app"])
+
+    def test_console_form_and_flash(self):
+        app = {"name": "my-app", "repo": "https://example.com/org/my-app.git", "port": 8080, "db": True,
+               "secrets": ["DATABASE_URL"], "visibility": "external", "url": "https://my-app.example.com", "commit": "abc",
+               "data_mounts": [{"source": "/var/lib/notes", "target": "/notes"}], "site_domains": ["notes.example.com"]}
+        html = console.delete_form(app, "tok")
+        self.assertIn("action=\"/apps/my-app/delete\"", html)
+        self.assertIn("name=backup value=1 checked", html)
+        self.assertIn("Type <code>my-app</code>", html)
+        for word in ("Containers", "edge route", "Postgres", "buckets", "secret files"):
+            self.assertIn(word, html)
+        self.assertIn("/var/lib/notes:/notes", html)
+        self.assertIn("notes.example.com", html)
+        self.assertNotIn("SUPERSECRETVALUE", html)
+        flash = console.delete_flash({"app": "my-app", "backup_path": "/srv/opencloud/backups/deleted/my-app-20261020T000000Z",
+                                       "steps": [{"step": "data_mount", "status": "kept", "detail": "/var/lib/notes:/notes"}]})
+        self.assertIn("/srv/opencloud/backups/deleted/my-app-20261020T000000Z", flash)
+        self.assertIn("Left in place: /var/lib/notes:/notes", flash)
+        self.assertIn("No backup was taken.", console.delete_flash({"app": "my-app", "backup_path": None, "steps": []}))
+        self.assertEqual(console.job_app({"app": "my-app", "app_deleted": True}), "my-app <small>(deleted)</small>")
+        self.assertIn('href="/apps/my-app"', console.job_app({"app": "my-app"}))
+        calls = {}
+
+        def fake_agent(method, path, body=None):
+            calls["path"] = path
+            calls["body"] = body
+            if path == "/apps":
+                return [app]
+            if path.endswith("/map"):
+                return {"app": "my-app", "commit": "abc", "route": None, "services": {}, "db": True, "buckets": ["my-app-files"],
+                        "gateway_key": False, "endpoints": [], "api": {"spec_path": "/openapi.json", "source": None, "endpoints": [], "checks": {}}}
+            if path.endswith("/releases"):
+                return []
+            if path.endswith("/logs"):
+                return {"logs": ""}
+            return {"ok": True, "deleted": True, "app": "my-app", "backup_path": "/srv/opencloud/backups/deleted/my-app", "steps": []}
+        real_agent, real_watch = console.agent, console.watch
+        console.agent = fake_agent
+        console.watch = lambda *a, **k: {"ok": True}
+        try:
+            _, page = console.view("/apps/my-app", "tok")
+            self.assertIn("Delete app", page)
+            self.assertIn("name=backup value=1 checked", page)
+        finally:
+            console.agent, console.watch = real_agent, real_watch
 
 
 if __name__ == "__main__":

@@ -17,11 +17,13 @@ flowchart LR
 
 ## The deployer
 
-The deployer builds an app from its Dockerfile, starts the container, stops it, and rolls it back to the previous image.
+The deployer builds an app from its Dockerfile, starts the container, stops it, rolls it back to the previous image, and deletes one app.
 
 It is the container named `oc-agent` (source in `agent/`). It is the only container with the Docker socket, so it is root-equivalent on the host. It has no published ports. It listens only on the internal `oc_control` network, and only after it checks a generated token. Callers do not send it shell commands. They ask for one of a fixed list of actions (deploy, redeploy, roll back, create a database, write a secret, and so on), and each action checks its inputs before it does anything.
 
 When a build is needed, the deployer hands the Dockerfile to the builder. The builder is a separate rootless BuildKit container (`oc-builder`). It has no Docker socket and no host mounts. It can download packages. It cannot open the deployer's API, because that API is not on the builder's network.
+
+Deleting an app is one of those actions (`POST /apps/<name>/delete`). The name has to match `^[a-z][a-z0-9-]{1,30}$` and cannot be reserved or start with `site-`. The caller has to send that same name back as confirmation, and a build already running for that app is refused. A name with no app definition and no app folder is refused unless the deployer already recorded that delete. The deployer only removes that app's containers, images, the route file it wrote, database files, buckets, secrets, and folders under `$OC_ROOT`. Host mounts and hand-written edge files are left in place. Job and release history is kept and marked deleted.
 
 The console never talks to Docker. It calls the deployer.
 

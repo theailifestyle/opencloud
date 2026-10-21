@@ -9,7 +9,7 @@ A self-hosted console for one Linux server. It builds apps from public Git repos
 | You know it as (AWS / GCP) | Open Cloud |
 |---|---|
 | Management Console | **Console**: one admin login (scrypt, sessions, CSRF, rate limits, optional [two-step login](docs/LOGIN.md)) |
-| App Runner / Cloud Run | **App Runner**: a public Git URL, or an allowlisted server folder, with a Dockerfile. Build, run, roll back, per-app CPU and memory, optional health check and read-only root. New apps are **Internal** |
+| App Runner / Cloud Run | **App Runner**: a public Git URL, or an allowlisted server folder, with a Dockerfile. Build, run, roll back, delete, per-app CPU and memory, optional health check and read-only root. New apps are **Internal**. Delete asks for the app name and takes a final backup unless you turn that off |
 | CodeBuild / Cloud Build | **Deployer**: background build and rollback jobs in a rootless BuildKit sandbox |
 | Elastic Load Balancing + ACM | **Open ELB**: Caddy routes, automatic HTTPS, custom domains, HTTP to HTTPS, health checks, canary |
 | RDS / Cloud SQL | **Managed Postgres**: one private Postgres 17 per app. The app connects as `app_runtime`. `DATABASE_URL` is a secret file |
@@ -38,7 +38,7 @@ flowchart LR
   Deployer --> Backups[(restic backups)]
 ```
 
-The **deployer** (`oc-agent`) is the program that builds an app, starts it, stops it, and rolls it back. It is the only container that can talk to Docker. Builds run in a separate rootless sandbox (the builder) that cannot reach the deployer's API. Everything else is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The **deployer** (`oc-agent`) is the program that builds an app, starts it, stops it, rolls it back, and deletes it. It is the only container that can talk to Docker. Builds run in a separate rootless sandbox (the builder) that cannot reach the deployer's API. Everything else is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Quick start
 

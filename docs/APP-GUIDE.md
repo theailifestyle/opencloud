@@ -24,6 +24,7 @@ The console has the same guide under **App Runner → Prepare your app** (`/guid
 2. **Add what it needs** on the service page: **Create Postgres database**, **Create bucket**, **Enable Open Bedrock**,
    and **Save secret** for your own settings. Each of these restarts the app with the new values. No rebuild needed.
 3. **Deploy again** (Redeploy) whenever you push code. **Roll back** returns to the previous image. The deployer does both.
+4. **Delete** on the service page removes the app (containers, route, database, bucket, secrets, and files). Type the app name. Leave the backup box ticked unless you have already copied what you need. See [DEPLOY.md](DEPLOY.md).
 
 ## 3. How values arrive: files, not environment variables
 Everything except `PORT` arrives as a **file**: `/run/secrets/<NAME>`. The file holds the value, with no trailing newline.
