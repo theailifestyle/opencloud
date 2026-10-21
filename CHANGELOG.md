@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- README: placeholder video teaser near the top (`docs/assets/teaser-placeholder.png`).
 - Delete an app from its service page. The deployer removes that app's containers, edge route, database, buckets, secrets, and files. A final backup (database dump, bucket objects, app definition, and `/data`) is on by default and is written under `$OC_ROOT/backups/deleted/`. Host mounts and hand-written edge files are left in place. Deploy jobs and release records are kept and marked deleted.
 - App names cannot start with `site-`. Delete refuses a name that is not an app unless a delete was already recorded, and it removes an edge file only when the deployer wrote that file. A bucket shared with another key (including by `Write`, `List`, `Tagging`, or `Admin` on that bucket) is not deleted. The database dump runs only inside that app's Postgres container as the user `app`.
 - The final backup of an app downloads every object in its buckets. A backup that fails is renamed to end with `-incomplete` and is not used; the app stays.
