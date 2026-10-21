@@ -5,7 +5,7 @@ A self-hosted console for one Linux server. It builds apps from public Git repos
 *Independent project; not affiliated with or endorsed by Amazon Web Services. AWS service names are used only for comparison.*
 
 <p align="center">
-  <a href="https://github.com/theailifestyle/opencloud/blob/main/docs/assets/opencloud-teaser.mp4"><img src="docs/assets/teaser.png" alt="Open Cloud: 34-second teaser (click to play)" width="720"></a>
+  <a href="https://www.youtube.com/watch?v=F0bkebAID_c"><img src="docs/assets/teaser.png" alt="Open Cloud: watch the video on YouTube" width="720"></a>
 </p>
 
 <p align="center">
